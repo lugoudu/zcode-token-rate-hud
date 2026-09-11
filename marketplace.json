@@ -1,0 +1,22 @@
+{
+  "version": "1.0.0",
+  "name": "token-rate-local",
+  "description": "本地插件市场：ZCode 会话内 token 速率遥测工具。",
+  "owner": {
+    "name": "wangnan"
+  },
+  "plugins": [
+    {
+      "name": "token-rate-hud",
+      "source": "./token-rate-hud",
+      "description": "token 速率 HUD：任务窗口实时注入速率与用量，可选 DeepSeek 风格回答页脚（用时 · 首 token · tok/s · 模型），一键装/卸。",
+      "version": "1.4.1",
+      "category": "productivity",
+      "keywords": [
+        "token-rate",
+        "telemetry",
+        "hud"
+      ]
+    }
+  ]
+}
