@@ -62,7 +62,9 @@ def fold_turns(path=DB_PATH, limit=800, scan_limit=MODEL_SCAN_LIMIT):
         min_start = min(r[4] or 0 for r in rows)
 
         # 按轮折叠解码时间、模型列表，并抓每轮最后一次调用的上下文占用
+        # calls = 该轮已完成的主对话调用数（与实时行 n_calls 同口径）
         dec = {}
+        calls_by_turn = {}
         models_by_turn = {}
         ctx_by_turn = {}
         for turn_id, model_id, started, decode_ms, decode_tok, ctx in conn.execute(
@@ -85,6 +87,7 @@ def fold_turns(path=DB_PATH, limit=800, scan_limit=MODEL_SCAN_LIMIT):
         ):
             d, tok = dec.get(turn_id, (0, 0))
             dec[turn_id] = (d + (decode_ms or 0), tok + (decode_tok or 0))
+            calls_by_turn[turn_id] = calls_by_turn.get(turn_id, 0) + 1
             if model_id:
                 lst = models_by_turn.setdefault(turn_id, [])
                 if model_id not in lst:
@@ -111,6 +114,7 @@ def fold_turns(path=DB_PATH, limit=800, scan_limit=MODEL_SCAN_LIMIT):
                 "ttft_ms": ttft,
                 "tps": round(tps, 2) if tps else None,
                 "out_tokens": decode_tok or (out_tok or 0),
+                "calls": calls_by_turn.get(tid, 0),
                 "models": models_by_turn.get(tid, []),
                 "ctx_tokens": ctx_by_turn.get(tid),
             }

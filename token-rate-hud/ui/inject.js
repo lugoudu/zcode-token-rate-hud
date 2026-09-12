@@ -97,6 +97,7 @@
     if (t.ttft_ms != null && t.ttft_ms >= 0) parts.push(`首 token ${fmtLat(t.ttft_ms)}秒`);
     if (t.tps) parts.push(`${fmtTps(t.tps)} tok/s`);
     if (SHOW_CTX && t.ctx_tokens) parts.push(`ctx ${fmtTok(t.ctx_tokens)}`);
+    if (t.calls > 1) parts.push(`${t.calls} 次调用`);
     if (Array.isArray(t.models) && t.models.length) parts.push(t.models.join("/"));
     if (t.status && t.status !== "completed") parts.push("（已取消）");
     line.textContent = parts.join(" · ");

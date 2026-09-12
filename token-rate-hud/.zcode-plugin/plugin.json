@@ -1,6 +1,6 @@
 {
   "name": "token-rate-hud",
-  "version": "1.5.0",
+  "version": "1.5.1",
   "description": "在每条回答下方显示 token 速率统计页脚（用时 · 首 token · tok/s · 模型 · ctx，流式生成时实时刷新，历史回答自动补齐）。全部展示在界面层完成，零上下文注入、不干扰模型；含 /token-rate 报告与实时仪表盘。",
   "description_i18n": {
     "en": "Shows a token-rate stats footer under every answer (duration · TTFT · tok/s · model · ctx, live-refreshing while streaming). All display happens in the UI layer with zero context injection; /token-rate report and live dashboard included.",
