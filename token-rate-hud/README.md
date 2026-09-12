@@ -18,9 +18,9 @@
 
   带 `~` 的是实时估算值（AI 正在打字，数的是屏幕上文字的增长速度），回答结束后自动变成上面那种精确值。
 
-- **任务窗口里**每次干完一步活，还会有一行更细的遥测（出/入速率、缓存命中、本轮累计），以及随时可查的报告和网页仪表盘。
+- **随时可查的报告和网页仪表盘**：输入 `/token-rate` 看详细账单（每次调用、每轮汇总），`/token-rate live` 打开每秒刷新的网页仪表盘。
 
-全部数据来自你电脑上的本地文件，不联网、不上传任何东西。
+全部数据来自你电脑上的本地文件，不联网、不上传任何东西。**插件也绝不往 AI 的对话上下文里写任何东西**——所有展示都在界面层完成，对模型零干扰。
 
 ## 装它（macOS）
 
@@ -29,7 +29,7 @@
 1. ZCode → 设置 → 插件管理 → 发现 → 点 `+` → 选本仓库里的 `token-rate-hud` 的**上层目录**（即含 `marketplace.json` 的那个文件夹）
 2. 列表里出现 token-rate-hud → 安装 → 重启会话
 
-装完就有：任务窗口遥测行、`/token-rate` 报告、仪表盘。
+装完就有：`/token-rate` 报告和网页仪表盘。
 
 再装回答下面的统计行（可选，只支持 macOS 桌面版）：
 
@@ -46,7 +46,6 @@
 | 看这轮花了多少 token、跑多快 | 直接看回答下面那行小字 |
 | 查详细账单（每次调用、每轮汇总） | 输入 `/token-rate` |
 | 打开网页仪表盘（每秒刷新的大数字） | 输入 `/token-rate live`，浏览器开 http://127.0.0.1:7864 |
-| 觉得任务窗口那行遥测多余 | `/token-rate hud-off`（想恢复就 `hud-on`） |
 | 不想要回答下面的统计行了 | `/token-rate ui-off` |
 | 检查装没装好 | `/token-rate ui-status` |
 
@@ -77,7 +76,7 @@ ZCode 干活时，每一次“想一下”（模型调用）都会在你电脑�
 - `~/.zcode/cli/db/db.sqlite`（官方用量库，页脚用它）：
   - `turn_usage`：按轮聚合，含 `user_message_id`（界面 `section[data-turn-id]` 的桥）、TTFT、状态
   - `model_usage`：按次调用明细，含 `time_to_first_token_ms`
-- `~/.zcode/cli/rollout/model-io-sess_*.jsonl`（模型 I/O 日志，任务窗口 HUD 用它）
+- `~/.zcode/cli/rollout/model-io-sess_*.jsonl`（模型 I/O 日志，`/token-rate` 报告用它）
 
 | 指标 | 定义 |
 |---|---|
@@ -87,7 +86,7 @@ ZCode 干活时，每一次“想一下”（模型调用）都会在你电脑�
 | tok/s（实时 ~） | 渲染层每秒测界面文本字符增速 × chars/token 校准比（EMA，随调用完成自动校准，持久化于 `ui/calib.json`）；仅在流式输出时显示 |
 | 模型 | 本轮用过的模型，多个用 `/` 拼接 |
 | ctx | 本轮最后一次调用的上下文占用（`computed_total_tokens`） |
-| HUD 出速率 | 最近一次调用 `outputTokens ÷ durationMs`（含首包等待，略低于页脚口径） |
+| 出速率（报告） | 最近一次调用 `outputTokens ÷ durationMs`（含首包等待，略低于页脚口径） |
 
 过滤：`model_usage` 只取 `status='completed'` 且 `query_source='main_turn'`（排除标题生成等旁路调用与失败重试）。GLM 通道的 `inputTokens` 含缓存读、Anthropic 风格不含，按 `inputTokens >= cacheReadTokens` 自适应去重。
 
@@ -112,7 +111,7 @@ ZCode 干活时，每一次“想一下”（模型调用）都会在你电脑�
 ```
 token-rate-hud/
 ├── .zcode-plugin/plugin.json   # 插件清单
-├── hooks/hooks.json            # SessionStart / PostToolUse / Stop
+├── hooks/hooks.json            # SessionStart（仅运维：重置状态、拉起数据服务；不向模型输出任何内容）
 ├── hooks/token_rate_hook.py    # hook 入口（任何异常静默，绝不干扰会话）
 ├── lib/tokrate.py              # 核心库 + CLI（hook/报告/服务/UI 安装）
 ├── lib/usage_db.py             # SQLite 用量库只读折叠层

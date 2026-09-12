@@ -52,17 +52,6 @@ python3 "$T" ui-status
 cd /tmp && nohup python3 "$T" serve --port 7864 >/tmp/token-rate-hud.log 2>&1 &
 ```
 
-告诉用户仪表盘地址为 http://127.0.0.1:7864 （每秒刷新当前出/入速率、本轮与会话累计、上下文占用、最近 64 次调用速率柱状图）；用 `pkill -f "tokrate.py serve"` 停止。
-
-## 参数为 hud-off / hud-on：开关任务窗口注入行
-
-安装了界面页脚之后，任务窗口里那行 ⚡ 遥测（每次注入约占 40 token 上下文）可能显得多余。用它开关：
-
-```bash
-touch ~/.zcode/token-rate-hud/hud-off    # 关闭（页脚不受影响）
-rm -f ~/.zcode/token-rate-hud/hud-off    # 恢复
-```
-
-说明：开关即时生效，无需重启会话。
+告诉用户仪表盘地址为 http://127.0.0.1:7864 （每秒刷新当前速率、进行中轮次、最近 64 次调用速率柱状图）；用 `pkill -f "tokrate.py serve"` 停止。
 
 若任一命令提示找不到数据源，说明当前 ZCode 版本不写用量数据，向用户说明该限制即可。

@@ -10,30 +10,6 @@
           }
         ]
       }
-    ],
-    "PostToolUse": [
-      {
-        "hooks": [
-          {
-            "type": "command",
-            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/hooks/token_rate_hook.py\" post",
-            "timeoutMs": 5000,
-            "statusMessage": "⚡ token-rate：统计当前速率"
-          }
-        ]
-      }
-    ],
-    "Stop": [
-      {
-        "hooks": [
-          {
-            "type": "command",
-            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/hooks/token_rate_hook.py\" stop",
-            "timeoutMs": 5000,
-            "statusMessage": "⚡ token-rate：汇总本轮用量"
-          }
-        ]
-      }
     ]
   }
 }
