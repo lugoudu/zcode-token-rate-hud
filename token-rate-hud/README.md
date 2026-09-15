@@ -128,8 +128,13 @@ token-rate-hud/
 ├── ui/enabled          # 页脚启用标记
 ├── ui/port             # 服务端口
 ├── ui/calib.json       # chars/token 校准比
+├── ui/lib/             # launchd 常驻运行的服务代码副本（跨插件版本稳定）
 └── ui/server.log       # 服务日志 + 页脚脚本诊断上报
 ```
+
+数据服务自 v1.5.2 起由 launchd 常驻（`~/Library/LaunchAgents/com.zcode.token-rate-hud.plist`，
+KeepAlive 保活 + 开机自启），`ui-install` 安装、`ui-uninstall` 卸载；`ui-status` 可查状态。
+此前「空闲 6h 自杀 + SessionStart 钩子拉起」的设计因钩子触发不可靠已被取代。
 
 | 变量 | 默认 | 说明 |
 |---|---|---|
@@ -137,7 +142,7 @@ token-rate-hud/
 | `TOKEN_RATE_MAX_CTX` | `0` | 设为模型上限（如 128000/256000）后 HUD 显示 ctx 百分比 |
 | `TOKEN_RATE_KEEP` | `128` | 状态保留的最近调用条数 |
 | `TOKEN_RATE_APP` | `/Applications/ZCode.app` | 应用路径覆盖 |
-| `TOKEN_RATE_IDLE_EXIT` | `21600` | 服务空闲退出秒数 |
+| `TOKEN_RATE_IDLE_EXIT` | `21600` | 服务空闲退出秒数（launchd 常驻进程固定为不退出） |
 
 </details>
 

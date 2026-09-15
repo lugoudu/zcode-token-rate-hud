@@ -32,6 +32,8 @@ tokrate.py —— ZCode token 速率核心库与 CLI（token-rate-hud 插件）
   TOKEN_RATE_MAX_CTX   上下文窗口上限 token 数，用于占用百分比（默认 0 = 不显示百分比；
                        例如 GLM-5.x 设 128000、Claude 系设 200000）
   TOKEN_RATE_KEEP      状态中保留的最近调用条数（默认 128）
+  TOKEN_RATE_IDLE_EXIT 服务空闲多少秒后自动退出（默认 21600；launchd 常驻进程设为
+                       999999999 即不退出，由 launchd KeepAlive 保活）
 
 口径说明：部分通道（GLM 编程套餐）的 inputTokens 已包含 cacheReadTokens，
 部分通道（Anthropic 风格）则不包含。本工具按 “inputTokens >= cacheReadTokens
@@ -951,7 +953,8 @@ def ui_install(port, show_ctx, skip_verify=False):
     marker = _marker_in(ASAR, work)
     if marker is True:
         print("② 当前 app.asar 已含注入标记，无需重打包。")
-        print(f"✅ 完成。请完全退出 ZCode（Cmd+Q）再打开；数据服务会在会话启动时自动拉起。")
+        print(f"✅ 完成。数据服务常驻：{launchd_install(port)}")
+        print("   请完全退出 ZCode（Cmd+Q）再打开；数据服务由 launchd 保活、开机自启。")
         return 0
 
     if _asar(work) is None:
@@ -1021,6 +1024,7 @@ def ui_install(port, show_ctx, skip_verify=False):
             print("   签名校验：未通过（改包后属正常现象；无 quarantine 隔离标记时不影响启动）")
 
     _sh.rmtree(work, ignore_errors=True)  # 清理临时解包目录（约 600MB）
+    print(f"⑨ 数据服务常驻：{launchd_install(port)}")
     print("✅ 完成。请完全退出 ZCode（Cmd+Q）再打开，每条回答下方即出现统计行。")
     print(f"   还原：python3 {os.path.abspath(__file__)} ui-uninstall")
     return 0
@@ -1074,6 +1078,7 @@ def ui_uninstall():
             os.remove(p)
         except OSError:
             pass
+    print(f"数据服务常驻：{launchd_remove()}")
     _stop_server()
     _sh.rmtree(work, ignore_errors=True)
     if os.path.exists(BAK):
@@ -1102,6 +1107,9 @@ def _ensure_server(port, quiet=False):
     """界面页脚依赖的本地数据服务；未运行则后台拉起（不阻塞 hook）。"""
     if _server_alive(port):
         return "已在运行"
+    if os.path.exists(LAUNCHD_PLIST):  # launchd 常驻：交给 launchd 拉起，避免双进程抢端口
+        _run(["launchctl", "kickstart", f"{_launchd_domain()}/{LAUNCHD_LABEL}"])
+        return "已请求 launchd 拉起"
     os.makedirs(UI_DIR, exist_ok=True)
     log_p = os.path.join(UI_DIR, "server.log")
     cmd = [sys.executable, os.path.abspath(__file__), "serve", "--port", str(port)]
@@ -1126,6 +1134,101 @@ def _stop_server():
     return "无运行中的服务"
 
 
+# ---- launchd 常驻：数据服务保活 + 开机自启（ui-install 装，ui-uninstall 卸） ----
+# 背景：服务原有「空闲 6h 自杀 + SessionStart 钩子拉起」的设计，但实测该钩子在
+# ZCode 升级后不再可靠触发，服务一旦空闲退出就永远起不来，页脚随之消失。
+LAUNCHD_LABEL = "com.zcode.token-rate-hud"
+LAUNCHD_PLIST = os.path.join(HOME, "Library", "LaunchAgents", LAUNCHD_LABEL + ".plist")
+STAGE_LIB = os.path.join(UI_DIR, "lib")
+
+
+def _launchd_domain():
+    return f"gui/{os.getuid()}"
+
+
+def _stage_lib():
+    """把 lib 两件套复制到 UI_DIR/lib，给 launchd 一个跨插件版本稳定的运行路径。"""
+    import shutil as _sh
+    here = os.path.dirname(os.path.abspath(__file__))
+    os.makedirs(STAGE_LIB, exist_ok=True)
+    _sh.copy2(os.path.join(here, "usage_db.py"), os.path.join(STAGE_LIB, "usage_db.py"))
+    _sh.copy2(os.path.join(here, "tokrate.py"), os.path.join(STAGE_LIB, "tokrate.py"))
+
+
+def launchd_install(port):
+    """写入 LaunchAgent 并加载（KeepAlive 保活 + RunAtLoad 开机自启）。
+
+    常驻进程通过 TOKEN_RATE_IDLE_EXIT=999999999 关闭空闲自杀——保活与空闲退出
+    并存只会造成退出/重启的无意义循环。"""
+    try:
+        _stage_lib()
+        entry = os.path.join(STAGE_LIB, "tokrate.py")
+        plist = (
+            '<?xml version="1.0" encoding="UTF-8"?>\n'
+            '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"'
+            ' "http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n'
+            '<plist version="1.0"><dict>\n'
+            f'  <key>Label</key><string>{LAUNCHD_LABEL}</string>\n'
+            '  <key>ProgramArguments</key>\n  <array>\n'
+            f'    <string>{sys.executable}</string>\n'
+            f'    <string>{entry}</string>\n'
+            '    <string>serve</string>\n'
+            '    <string>--port</string>\n'
+            f'    <string>{port}</string>\n'
+            '  </array>\n'
+            '  <key>EnvironmentVariables</key><dict>\n'
+            '    <key>TOKEN_RATE_IDLE_EXIT</key><string>999999999</string>\n'
+            '  </dict>\n'
+            '  <key>RunAtLoad</key><true/>\n'
+            '  <key>KeepAlive</key><true/>\n'
+            f'  <key>StandardOutPath</key><string>{os.path.join(UI_DIR, "server.log")}</string>\n'
+            f'  <key>StandardErrorPath</key><string>{os.path.join(UI_DIR, "server.log")}</string>\n'
+            '  <key>WorkingDirectory</key><string>/tmp</string>\n'
+            '  <key>ProcessType</key><string>Background</string>\n'
+            '</dict></plist>\n'
+        )
+        os.makedirs(os.path.dirname(LAUNCHD_PLIST), exist_ok=True)
+        with open(LAUNCHD_PLIST, "w", encoding="utf-8") as f:
+            f.write(plist)
+        _run(["launchctl", "bootout", f"{_launchd_domain()}/{LAUNCHD_LABEL}"])  # 已加载则先卸（忽略失败）
+        r = _run(["launchctl", "bootstrap", _launchd_domain(), LAUNCHD_PLIST])
+        if r.returncode != 0:
+            r = _run(["launchctl", "load", "-w", LAUNCHD_PLIST])  # 旧版兜底
+        if r.returncode != 0:
+            return f"✗ launchd 加载失败：{(r.stderr or r.stdout)[:200]}"
+        return f"已装并加载（{LAUNCHD_PLIST}）"
+    except OSError as exc:
+        return f"✗ 安装失败：{exc}"
+
+
+def launchd_remove():
+    import shutil as _sh
+    if not os.path.exists(LAUNCHD_PLIST) and not os.path.isdir(STAGE_LIB):
+        return "未安装"
+    _run(["launchctl", "bootout", f"{_launchd_domain()}/{LAUNCHD_LABEL}"])
+    _run(["launchctl", "unload", "-w", LAUNCHD_PLIST])  # 旧版兜底，忽略失败
+    try:
+        os.remove(LAUNCHD_PLIST)
+    except OSError:
+        pass
+    _sh.rmtree(STAGE_LIB, ignore_errors=True)
+    return "已卸载"
+
+
+def launchd_state():
+    """返回 (plist 存在, launchd 已加载, pid)。"""
+    plist_ok = os.path.exists(LAUNCHD_PLIST)
+    r = _run(["launchctl", "print", f"{_launchd_domain()}/{LAUNCHD_LABEL}"])
+    loaded = r.returncode == 0
+    pid = None
+    if loaded:
+        for ln in (r.stdout or "").splitlines():
+            if ln.strip().startswith("pid ="):
+                pid = ln.split("=", 1)[1].strip()
+                break
+    return plist_ok, loaded, pid
+
+
 def ui_status():
     port = _server_port()
     marker = None
@@ -1140,6 +1243,8 @@ def ui_status():
     print(f"  界面脚本        ：{'就位 ' + STAGE_JS if os.path.exists(STAGE_JS) else '未生成'}")
     print(f"  启用标记        ：{'有' if os.path.exists(ENABLED_FLAG) else '无'}")
     print(f"  数据服务        ：{'运行中' if _server_alive(port) else '未运行'}（端口 {port}）")
+    plist_ok, loaded, pid = launchd_state()
+    print(f"  launchd 常驻    ：{'已装' if plist_ok else '未装'}（launchd {'已加载' if loaded else '未加载'}，pid {pid or '-'}）")
     print(f"  用量库          ：{'可用' if usage_db.db_available() else '缺失'}（{usage_db.DB_PATH}）")
     if marker is False:
         print("  → 若刚升级过 ZCode，重跑 ui-install 即可恢复页脚")
