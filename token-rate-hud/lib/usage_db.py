@@ -16,6 +16,13 @@ usage_db.py —— ZCode 本地用量库（SQLite）只读折叠层
 
 过滤：model_usage 仅取 status='completed' 且 query_source='main_turn'，
       排除标题生成、压缩等旁路调用与失败重试。
+
+工作流（2026 新功能）：子代理调用 query_source='workflow_child'，落在独立
+子会话（sess_dwf-dwfrun-…-actor_N_M）。关联链 dwf_run(parent_session_id)
+→ dwf_actor(名字/子会话) → model_usage；fold_turns 把其用量按时间窗归并进
+主会话对应轮次的 wf_* 字段（不并入主代理 tps，避免并行失真），
+workflow_live() 供 /live 实时块按子代理聚合。普通 Agent 工具子代理
+（query_source='subagent'）暂未纳入，仅做了会话排除防劫持。
 """
 
 import sqlite3
@@ -94,6 +101,38 @@ def fold_turns(path=DB_PATH, limit=800, scan_limit=MODEL_SCAN_LIMIT):
                     lst.append(model_id)
             if ctx is not None:
                 ctx_by_turn[turn_id] = ctx  # 后写覆盖，最终为本轮最后一次
+
+        # 工作流子代理归并备料：dwf_run → dwf_actor → model_usage(workflow_child)
+        # 两次批量查询拿到「哪个主会话的哪段时间窗里跑了哪些工作流用量」，
+        # 旧版 ZCode 无 dwf_* 表时整段跳过（静默，不影响主口径）。
+        wf_runs = []
+        wf_agg = {}
+        try:
+            wf_runs = conn.execute(
+                "SELECT id, parent_session_id, time_created FROM dwf_run "
+                "WHERE time_created >= ?",
+                (min_start,),
+            ).fetchall()
+            if wf_runs:
+                qm = ",".join("?" * len(wf_runs))
+                for rid, calls, out_tok, actors in conn.execute(
+                    f"""
+                    SELECT a.run_id, COUNT(m.id),
+                           COALESCE(SUM(m.output_tokens), 0),
+                           COUNT(DISTINCT CASE WHEN m.id IS NOT NULL THEN a.session_id END)
+                    FROM dwf_actor a
+                    LEFT JOIN model_usage m
+                           ON m.session_id = a.session_id
+                          AND m.query_source = 'workflow_child'
+                          AND m.status = 'completed'
+                    WHERE a.run_id IN ({qm})
+                    GROUP BY a.run_id
+                    """,
+                    [r[0] for r in wf_runs],
+                ):
+                    wf_agg[rid] = (calls, out_tok, actors)
+        except sqlite3.Error:
+            wf_runs = []
     finally:
         conn.close()
 
@@ -117,8 +156,27 @@ def fold_turns(path=DB_PATH, limit=800, scan_limit=MODEL_SCAN_LIMIT):
                 "calls": calls_by_turn.get(tid, 0),
                 "models": models_by_turn.get(tid, []),
                 "ctx_tokens": ctx_by_turn.get(tid),
+                "wf_runs": 0,
+                "wf_actors": 0,
+                "wf_calls": 0,
+                "wf_out_tokens": 0,
             }
         )
+    # 工作流用量归属：运行创建时刻落在哪个主会话轮次的时间窗内（2s 宽限）。
+    # 只并计数字段（wf_*），不并入主代理的 tps/out_tokens——并行执行下合并速率会失真。
+    for rid, parent, created in wf_runs:
+        if not created:
+            continue
+        c, o, a = wf_agg.get(rid, (0, 0, 0))
+        if not (c or o):
+            continue
+        for t in out:
+            if t["session_id"] == parent and t["start_ms"] - 2000 <= created <= t["end_ms"] + 2000:
+                t["wf_runs"] += 1
+                t["wf_calls"] += c
+                t["wf_out_tokens"] += o
+                t["wf_actors"] += a
+                break
     out.sort(key=lambda t: t["end_ms"] or 0, reverse=True)
     return out
 
@@ -151,10 +209,14 @@ def live_turn(path=DB_PATH, max_age_s=1200):
         # phase 0 检测：全局最新一条 user 消息若（a）晚于最近一次 main_turn 调用、
         # （b）尚未被任何 turn_usage 消费、（c）足够新 —— 即为新会话首轮或老会话新一轮
         # 的“提问已发出、首步未完成”窗口，行先亮起来。
+        # 必须排除子代理会话：工作流/Agent 子代理的会话会持续写入自己的 user 消息，
+        # 否则全局最新 user 消息被其劫持，实时行计时错乱（实测发生过）。
         try:
             lu = conn.execute(
                 """SELECT id, session_id, time_created FROM message
                    WHERE json_extract(data, '$.role') = 'user'
+                     AND session_id NOT LIKE 'sess_dwf%'
+                     AND session_id NOT LIKE 'sess_subagent%'
                    ORDER BY time_created DESC LIMIT 1"""
             ).fetchone()
         except sqlite3.Error:
@@ -176,8 +238,12 @@ def live_turn(path=DB_PATH, max_age_s=1200):
         if not head:
             return None
         tid, sid, last_started = head
-        if not last_started or now_ms - last_started > max_age_s * 1000:
-            return None  # 久无调用落库：不视为进行中
+        # 该主会话是否有运行中的工作流：主代理发起工作流后自身长时间无新调用
+        # （原本 20 分钟即超时摘行），且首个 main_turn 完成行可能还没落库——
+        # 这两种情形只要工作流在跑，轮次仍视为进行中，工作流块由服务层附上。
+        wf_running = _has_running_dwf(conn, sid, now_ms)
+        if not last_started or (now_ms - last_started > max_age_s * 1000 and not wf_running):
+            return None  # 久无调用落库且无运行中的工作流：不视为进行中
         done = conn.execute(
             "SELECT 1 FROM turn_usage WHERE turn_id = ? LIMIT 1", (tid,)
         ).fetchone()
@@ -191,10 +257,10 @@ def live_turn(path=DB_PATH, max_age_s=1200):
                ORDER BY started_at ASC""",
             (tid,),
         ).fetchall()
-        if not rows:
+        if not rows and not wf_running:
             return None
-        start_ms = rows[0][0] or last_started
-        ttft = rows[0][2]
+        start_ms = (rows[0][0] if rows else None) or last_started
+        ttft = rows[0][2] if rows else None
         decode_ms = decode_tok = out_tok = 0
         models = []
         ctx = None
@@ -290,6 +356,135 @@ def stream_chars_total(session_id, path=DB_PATH):
         return row[0] or 0
     except sqlite3.Error:
         return 0
+    finally:
+        conn.close()
+
+
+def _has_running_dwf(conn, session_id, now_ms, guard_s=600):
+    """该主会话是否有活跃工作流运行。
+
+    status='running' 且 time_updated 在 guard_s 内——双条件防止宿主进程
+    被杀后留下永久 running 的僵尸行把实时行钉死。旧版 ZCode 无 dwf 表时返回 False。
+    """
+    try:
+        row = conn.execute(
+            "SELECT 1 FROM dwf_run WHERE parent_session_id = ? AND status = 'running' "
+            "AND time_updated >= ? LIMIT 1",
+            (session_id, now_ms - guard_s * 1000),
+        ).fetchone()
+    except sqlite3.Error:
+        return False
+    return row is not None
+
+
+# 单个工作流运行的子代理聚合 SQL（LEFT JOIN 保证零调用的代理也占一行）
+_ACTOR_AGG_SQL = """
+SELECT a.name, a.session_id, a.resolved_model, a.ordinal,
+       COUNT(m.id),
+       COALESCE(SUM(m.output_tokens), 0),
+       MAX(m.completed_at),
+       COALESCE(SUM(CASE WHEN m.time_to_first_token_ms IS NOT NULL
+                          AND m.duration_ms - m.time_to_first_token_ms > 0
+                          AND m.output_tokens > 0
+                     THEN m.duration_ms - m.time_to_first_token_ms ELSE 0 END), 0),
+       COALESCE(SUM(CASE WHEN m.time_to_first_token_ms IS NOT NULL
+                          AND m.output_tokens > 0
+                     THEN m.output_tokens ELSE 0 END), 0),
+       MAX(m.model_id)
+FROM dwf_actor a
+LEFT JOIN model_usage m
+       ON m.session_id = a.session_id
+      AND m.query_source = 'workflow_child'
+      AND m.status = 'completed'
+WHERE a.run_id = ?
+GROUP BY a.id
+ORDER BY a.ordinal
+"""
+
+
+def workflow_live(path=DB_PATH, recent_s=20, active_s=15, stale_guard_s=600, max_runs=4):
+    """进行中（或刚结束 recent_s 秒宽限内）的工作流运行，按子代理聚合。
+
+    数据链：dwf_run(status/parent_session_id) → dwf_actor(名字/子会话)
+            → model_usage(query_source='workflow_child')。
+    返回新→旧的运行列表（无则 []，旧版 ZCode 无 dwf 表也返回 []）：
+      {run_id, run_name, parent_session_id, status, start_ms, update_ms,
+       elapsed_ms, out_tokens, tps, actors, n_active,
+       per_actor: [{name, model, session_id, n_calls, out_tokens, tps,
+                    active, last_ms}]}
+
+    口径：tps = Σ输出token ÷ Σ(duration−ttft)。各代理解码时段求和，
+    即并行流的合计吐字吞吐（用户要看的“总共跑多快”），非墙钟速率。
+    active 判据 = 最近 active_s 秒内有子调用完成，或存在 status='running'
+    的子调用行。running 但 time_updated 超过 stale_guard_s 的运行视为
+    宿主已死，不返回。
+    """
+    import os
+    import time as _time
+
+    path = os.path.expanduser(path)
+    now_ms = int(_time.time() * 1000)
+    conn = _connect(path)
+    try:
+        runs = conn.execute(
+            """
+            SELECT id, name, parent_session_id, status, time_created, time_updated
+            FROM dwf_run
+            WHERE (status = 'running' AND time_updated >= ?)
+               OR (status != 'running' AND time_updated >= ?)
+            ORDER BY time_updated DESC LIMIT ?
+            """,
+            (now_ms - stale_guard_s * 1000, now_ms - recent_s * 1000, max_runs),
+        ).fetchall()
+        if not runs:
+            return []
+        running_rows = {
+            r[0] for r in conn.execute(
+                "SELECT DISTINCT session_id FROM model_usage "
+                "WHERE query_source = 'workflow_child' AND status = 'running'"
+            )
+        }
+        out = []
+        for rid, name, parent, status, created, updated in runs:
+            per_actor = []
+            run_dec_ms = run_dec_tok = 0
+            for (aname, sid, rmodel, _ord, n, out_tok, last_ms,
+                 dec_ms, dec_tok, model_id) in conn.execute(_ACTOR_AGG_SQL, (rid,)):
+                model = model_id or (rmodel.rsplit("/", 1)[-1] if rmodel else None)
+                tps = (dec_tok * 1000.0 / dec_ms) if dec_ms > 0 else None
+                active = sid in running_rows or (
+                    last_ms is not None and last_ms >= now_ms - active_s * 1000
+                )
+                per_actor.append({
+                    "name": aname or sid.rsplit("-", 1)[-1],
+                    "model": model,
+                    "session_id": sid,
+                    "n_calls": n,
+                    "out_tokens": out_tok,
+                    "tps": round(tps, 2) if tps else None,
+                    "active": bool(active),
+                    "last_ms": last_ms,
+                })
+                run_dec_ms += dec_ms
+                run_dec_tok += dec_tok
+            tps_all = round(run_dec_tok * 1000.0 / run_dec_ms, 2) if run_dec_ms > 0 else None
+            out.append({
+                "run_id": rid,
+                "run_name": (name or "")[:24],
+                "parent_session_id": parent,
+                "status": status,
+                "start_ms": created,
+                "update_ms": updated,
+                "elapsed_ms": max(0, now_ms - (created or now_ms)),
+                "out_tokens": sum(a["out_tokens"] for a in per_actor),
+                "tps": tps_all,
+                "actors": len(per_actor),
+                "n_active": sum(1 for a in per_actor if a["active"]),
+                "per_actor": per_actor,
+            })
+        return out
+    except sqlite3.Error:
+        return []
     finally:
         conn.close()
 

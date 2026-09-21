@@ -3,9 +3,13 @@
  *
  * 挂载方式：install 时在渲染层 index.html 加一行 <script defer src="file://…/ui/inject.js">，
  *           由 ZCode 渲染层在启动时加载（幂等闸防重复）。
- * 数据源：http://127.0.0.1:__PORT__/turns（本地只读服务，SQLite 用量库，口径=纯解码速率）。
+ * 数据源：http://127.0.0.1:__PORT__/turns（本地只读服务，SQLite 用量库，口径=纯解码速率）、
+ *         /live（进行中轮次 + workflow 块：运行中的工作流按子代理聚合）。
  * 定位锚：ZCode 每轮对话是 <section data-turn-id="…">（虚拟滚动，滚到哪渲染哪；
  *         运行中的轮次另有一个 data-v4-running-live-tail 元素，同选择器）。
+ * 工作流：实时行末尾追加 ⟪ 工作流 活跃/总数 ⟫ 汇总段，其下另起第二行列出
+ *         逐个子代理（名字 + ~瞬时速率 / ✓累计）；轮次结束后静态行补
+ *         「工作流 N 代理 +Xk token」合计段（速率不并入主代理，避免并行失真）。
  * 设计约束：任何异常静默吞掉，绝不影响主界面；React 若删掉注入节点，observer 会重画。
  */
 (() => {
@@ -16,6 +20,7 @@
   const SHOW_CTX = __SHOW_CTX__;
   const MARK = "data-token-rate-footer";
   const LIVE_MARK = "data-token-rate-live";
+  const WF_MARK = "data-token-rate-wf";
   const LIVE_HOST_ATTR = "data-v4-running-live-tail";
   const CACHE_MS = 2000;
 
@@ -23,6 +28,12 @@
   let fetchedAt = 0;
 
   const norm = (s) => String(s || "").replace(/^(turn_|msg_)/, "");
+
+  // 子代理名/运行名截断（第二行明细最长 12 字，超出省略号）
+  const shortName = (s) => {
+    const t = String(s || "");
+    return t.length > 12 ? t.slice(0, 11) + "…" : t;
+  };
 
   async function fetchTurns() {
     if (Date.now() - fetchedAt < CACHE_MS) return;
@@ -98,6 +109,7 @@
     if (t.tps) parts.push(`${fmtTps(t.tps)} tok/s`);
     if (SHOW_CTX && t.ctx_tokens) parts.push(`ctx ${fmtTok(t.ctx_tokens)}`);
     if (t.calls > 1) parts.push(`${t.calls} 次调用`);
+    if (t.wf_actors) parts.push(`工作流 ${t.wf_actors} 代理 +${fmtTok(t.wf_out_tokens)}`);
     if (Array.isArray(t.models) && t.models.length) parts.push(t.models.join("/"));
     if (t.status && t.status !== "completed") parts.push("（已取消）");
     line.textContent = parts.join(" · ");
@@ -145,52 +157,103 @@
   }
   async function tickLive() {
     let live = null;
+    let wf = [];
     try {
       const r = await fetch(`${API}/live?_=${Date.now()}`);
       const j = await r.json();
       live = j.live || null;
+      wf = Array.isArray(j.workflow) ? j.workflow : [];
     } catch {
       /* 服务未起：静默 */
     }
     try {
       const host = document.querySelector(`section[${LIVE_HOST_ATTR}], [data-turn-id][${LIVE_HOST_ATTR}]`);
       let line = host && host.querySelector(`[${LIVE_MARK}]`);
-      if (!live) {
+      let wfLine = host && host.querySelector(`[${WF_MARK}]`);
+      if (!live && !wf.length) {
         if (line) line.remove();
+        if (wfLine) wfLine.remove();
         prevLen = 0;
         prevTs = 0;
         return;
       }
       if (!host) return;
-      if (!liveDiagOnce) {
+      if (!liveDiagOnce && live) {
         liveDiagOnce = true;
         diag(`LIVE host_id=${(host.getAttribute("data-turn-id") || "?").slice(0, 44)} msg_id=${(live.msg_id || "?").slice(0, 44)}`);
       }
-      if (!line) {
-        line = document.createElement("div");
-        line.setAttribute(LIVE_MARK, "1");
-        Object.assign(line.style, {
-          fontSize: "12px",
-          opacity: "0.75",
-          padding: "0 16px 4px",
-          userSelect: "none",
-          whiteSpace: "nowrap",
-          overflow: "hidden",
-          textOverflow: "ellipsis",
-        });
-        mountLine(host, line);
+      // 工作流单行汇总段（取最新一个运行）：⟪ 工作流 2/5 ⟫ ~120 tok/s
+      let wfSeg = "";
+      if (wf.length) {
+        const w = wf[0];
+        const sp = w.agg_instant
+          ? `~${fmtTps(w.agg_instant)} tok/s`
+          : w.tps
+            ? `${fmtTps(w.tps)} tok/s`
+            : "";
+        wfSeg = `⟪ 工作流 ${w.n_active}/${w.actors}${wf.length > 1 ? `+${wf.length - 1}` : ""} ⟫${sp ? ` ${sp}` : ""}`;
       }
-      const parts = [fmtStamp(live.start_ms), `进行中 ${fmtDur(live.elapsed_ms)}`];
-      if (!live.n_calls) parts.push("首步生成中…");
-      if (live.ttft_ms != null && live.ttft_ms >= 0) parts.push(`首 token ${fmtLat(live.ttft_ms)}秒`);
-      if (live.calib) liveCalib = live.calib;
-      const inst = localInstant(host) || live.instant_tps;
-      if (inst) parts.push(`~${fmtTps(inst)} tok/s`);
-      else if (live.tps) parts.push(`${fmtTps(live.tps)} tok/s`);
-      if (SHOW_CTX && live.ctx_tokens) parts.push(`ctx ${fmtTok(live.ctx_tokens)}`);
-      if (live.n_calls > 1) parts.push(`${live.n_calls} 次调用`);
-      if (Array.isArray(live.models) && live.models.length) parts.push(live.models.join("/"));
-      line.textContent = parts.join(" · ");
+      if (live) {
+        if (!line) {
+          line = document.createElement("div");
+          line.setAttribute(LIVE_MARK, "1");
+          Object.assign(line.style, {
+            fontSize: "12px",
+            opacity: "0.75",
+            padding: "0 16px 4px",
+            userSelect: "none",
+            whiteSpace: "nowrap",
+            overflow: "hidden",
+            textOverflow: "ellipsis",
+          });
+          mountLine(host, line);
+        }
+        const parts = [fmtStamp(live.start_ms), `进行中 ${fmtDur(live.elapsed_ms)}`];
+        if (!live.n_calls) parts.push("首步生成中…");
+        if (live.ttft_ms != null && live.ttft_ms >= 0) parts.push(`首 token ${fmtLat(live.ttft_ms)}秒`);
+        if (live.calib) liveCalib = live.calib;
+        const inst = localInstant(host) || live.instant_tps;
+        if (inst) parts.push(`~${fmtTps(inst)} tok/s`);
+        else if (live.tps) parts.push(`${fmtTps(live.tps)} tok/s`);
+        if (SHOW_CTX && live.ctx_tokens) parts.push(`ctx ${fmtTok(live.ctx_tokens)}`);
+        if (live.n_calls > 1) parts.push(`${live.n_calls} 次调用`);
+        if (Array.isArray(live.models) && live.models.length) parts.push(live.models.join("/"));
+        if (wfSeg) parts.push(wfSeg);
+        line.textContent = parts.join(" · ");
+      } else if (line) {
+        line.remove(); // 主轮已结束但工作流仍活跃：只留工作流行
+      }
+      // 第二行：逐个子代理明细（活跃的带 ~ 瞬时速率，完成的打 ✓）
+      if (wf.length) {
+        if (!wfLine) {
+          wfLine = document.createElement("div");
+          wfLine.setAttribute(WF_MARK, "1");
+          Object.assign(wfLine.style, {
+            fontSize: "12px",
+            opacity: "0.6",
+            padding: "0 16px 4px",
+            userSelect: "none",
+            whiteSpace: "nowrap",
+            overflow: "hidden",
+            textOverflow: "ellipsis",
+          });
+          mountLine(host, wfLine);
+        }
+        const segs = [];
+        for (const w of wf) {
+          const label = wf.length > 1 && w.run_name ? `${shortName(w.run_name)}：` : "";
+          const acts = (w.per_actor || []).slice(0, 8).map((a) => {
+            if (a.instant_tps) return `${shortName(a.name)} ~${fmtTps(a.instant_tps)}`;
+            if (a.active) return a.tps ? `${shortName(a.name)} ${fmtTps(a.tps)}` : `${shortName(a.name)} …`;
+            if (a.n_calls) return `${shortName(a.name)} ✓${fmtTok(a.out_tokens)}`;
+            return `${shortName(a.name)} …`;
+          });
+          segs.push(label + acts.join(" · "));
+        }
+        wfLine.textContent = segs.join(" ｜ ");
+      } else if (wfLine) {
+        wfLine.remove();
+      }
     } catch {
       /* 静默 */
     }

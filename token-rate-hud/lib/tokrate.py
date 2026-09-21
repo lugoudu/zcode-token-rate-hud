@@ -506,6 +506,23 @@ def mode_live():
         parts.append("/".join(lv["models"]))
     print(" · ".join(parts))
     print(f"  桥 msg_id={lv['msg_id']} turn={lv['turn_id']} session={lv['session_id']}")
+    try:
+        wf = _u.workflow_live() or []
+    except Exception:
+        wf = []
+    for run in wf:
+        state = "运行中" if run["status"] == "running" else run["status"]
+        agg = f"~{fmt_rate(run['agg_instant'])} " if run.get("agg_instant") else ""
+        cum = f"{fmt_rate(run['tps'])}" if run.get("tps") else "--"
+        print(f"\n⟪ 工作流 {run['run_name'] or run['run_id']} · {state} · "
+              f"{run['n_active']}/{run['actors']} 代理 · {agg}{cum} tok/s · "
+              f"{fmt_tok(run['out_tokens'])} tok ⟫")
+        for a in run["per_actor"][:12]:
+            seg = (f"~{fmt_rate(a['instant_tps'])}" if a.get("instant_tps")
+                   else (fmt_rate(a["tps"]) if a.get("tps") else "--"))
+            mark = "●" if a["active"] else "·"
+            print(f"  {mark} {a['name']:<16} {seg:>9} tok/s   "
+                  f"{a['n_calls']:>3} 次 {fmt_tok(a['out_tokens'])} tok")
     return 0
 
 
@@ -580,6 +597,9 @@ PAGE = """<!doctype html><html lang="zh"><head><meta charset="utf-8">
  .k{color:#8a97a3;font-size:12px}.v{font-size:22px;font-weight:600;margin-top:4px}
  canvas{background:#171d24;border:1px solid #232c36;border-radius:10px;margin-top:14px}
  .meta{color:#8a97a3;font-size:12px;margin-top:10px}
+ .wfrow{display:flex;gap:12px;padding:3px 0;font-size:13px;align-items:baseline}
+ .wfrow .nm{min-width:10em}
+ .dim{color:#8a97a3}
 </style></head><body>
 <div class="big"><span id="rate">--</span><span class="unit">tok/s 出</span></div>
 <div class="row">
@@ -589,10 +609,34 @@ PAGE = """<!doctype html><html lang="zh"><head><meta charset="utf-8">
  <div class="card"><div class="k">上下文占用</div><div class="v" id="ctx">--</div></div>
 </div>
 <canvas id="spark" width="880" height="140"></canvas>
+<div id="wfwrap" style="display:none">
+ <div class="k" style="margin:16px 0 6px">⟪ 工作流子代理 ⟫</div>
+ <div id="wf"></div>
+</div>
 <div class="meta" id="meta">连接中…</div>
 <script>
 const f=n=>n>=1e6?(n/1e6).toFixed(2)+'M':n>=1e3?(n/1e3).toFixed(1)+'k':String(n|0);
 const r=n=>n>=100?String(Math.round(n)):n.toFixed(1);
+const esc=s=>String(s||'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+function renderWf(ws){
+ if(!ws||!ws.length){wfwrap.style.display='none';return}
+ wfwrap.style.display='';
+ wf.innerHTML=ws.map(w=>{
+  const st=w.status==='running'?'运行中':(w.status==='completed'?'已完成':w.status);
+  let h='<div style="margin:10px 0 4px;font-weight:600">'+esc(w.run_name||w.run_id)
+   +' <span class="dim">· '+st+' · '+w.n_active+'/'+w.actors+' 代理'
+   +(w.agg_instant?' · ~'+r(w.agg_instant)+' tok/s':'')
+   +(w.tps?' · 累计 '+r(w.tps)+' tok/s':'')+' · '+f(w.out_tokens)+' tok</span></div>';
+  h+=(w.per_actor||[]).map(a=>'<div class="wfrow"><span style="width:1em">'
+   +(a.active?'●':'·')+'</span><span class="nm">'+esc(a.name)+'</span><span>'
+   +(a.instant_tps?('~'+r(a.instant_tps)+' tok/s')
+      :(a.active?(a.tps?(r(a.tps)+' tok/s'):'生成中…')
+        :(a.n_calls?('✓ '+f(a.out_tokens)+' tok'):'等待中')))
+   +'</span><span class="dim">'+a.n_calls+' 次 · '+f(a.out_tokens)+' tok'
+   +(a.model?' · '+esc(a.model):'')+'</span></div>').join('');
+  return h;
+ }).join('');
+}
 async function tick(){
  try{
   const s=await (await fetch('/api/stats')).json();
@@ -603,6 +647,7 @@ async function tick(){
   ctx.textContent=s.ctx?(f(s.ctx.tokens)+(s.ctx.pct!=null?'（'+s.ctx.pct+'%）':'')):'--';
   meta.textContent=s.session+' · '+s.model+' · 本轮 '+s.turn.n+' 次调用 · 更新于 '+new Date().toLocaleTimeString();
   draw(s.calls||[]);
+  renderWf(s.workflow||[]);
  }catch(e){meta.textContent='连接失败，重试中…'}
 }
 function draw(cs){
@@ -654,6 +699,57 @@ def mode_serve(port, session_id):
         "pid": None, "chars": 0, "ts": 0.0, "tps": None, "last_grow": 0.0,
         "calib": _calib, "last_out": -1, "last_chars_total": -1,
     }
+
+    # 工作流子代理实时块：workflow_live() 聚合 + 逐个活跃子会话的流式字符增量
+    # 估算瞬时速率（与主 stream 共用同一 chars/token 校准比）。
+    wf_cache = {"at": 0.0, "data": []}
+    wf_stream = {}
+
+    def _wf_payload():
+        if time.time() - wf_cache["at"] > 1.0:
+            data = []
+            try:
+                data = usage_db.workflow_live() or []
+            except Exception:
+                data = []
+            now = time.time()
+            seen = set()
+            for run in data:
+                agg = 0.0
+                for a in run.get("per_actor", []):
+                    sid = a.get("session_id")
+                    if not sid:
+                        continue
+                    seen.add(sid)
+                    st = wf_stream.setdefault(
+                        sid, {"pid": None, "chars": 0, "ts": 0.0,
+                              "tps": None, "last_grow": 0.0}
+                    )
+                    try:
+                        sc = usage_db.stream_chars(sid)
+                    except Exception:
+                        sc = None
+                    if sc:
+                        if sc[0] == st["pid"]:
+                            if sc[1] > st["chars"] and now - st["ts"] >= 0.5:
+                                cps = (sc[1] - st["chars"]) / (now - st["ts"])
+                                st["tps"] = round(cps / stream["calib"], 1)
+                                st["last_grow"] = now
+                        else:
+                            st["pid"], st["chars"], st["ts"] = sc[0], sc[1], now
+                        if sc[0] == st["pid"]:
+                            st["chars"], st["ts"] = sc[1], now
+                    if now - st["last_grow"] > 3.0:
+                        st["tps"] = None  # 该子代理超 3 秒无字符增长：瞬时作废
+                    a["instant_tps"] = st["tps"]
+                    if a.get("active") and st["tps"]:
+                        agg += st["tps"]
+                run["agg_instant"] = round(agg, 1) if agg else None
+            for sid in [k for k in wf_stream if k not in seen]:
+                wf_stream.pop(sid, None)  # 运行结束/宽限过期：清理跟踪器
+            wf_cache["data"] = data
+            wf_cache["at"] = now
+        return wf_cache["data"]
 
     def _live_payload():
         lv = usage_db.live_turn()
@@ -729,13 +825,16 @@ def mode_serve(port, session_id):
                 if self.path.startswith("/live"):
                     # 进行中轮次的实时数据（1s 缓存；注入脚本每秒轮询），
                     # 含流式瞬时速率 instant_tps（字符增量换算，自动校准）
+                    # 与 workflow 块（运行中的工作流按子代理聚合，含逐代理瞬时速率）
                     if time.time() - live_cache["at"] > 1.0:
                         try:
                             live_cache["data"] = _live_payload()
                         except Exception:
                             pass  # 查询失败沿用上次结果
                         live_cache["at"] = time.time()
-                    return self._send(json.dumps({"live": live_cache["data"]}, ensure_ascii=False))
+                    return self._send(json.dumps(
+                        {"live": live_cache["data"], "workflow": _wf_payload()},
+                        ensure_ascii=False))
                 if self.path.startswith("/healthz"):
                     return self._send("ok", "text/plain")
                 if self.path.startswith("/diag"):
@@ -756,6 +855,7 @@ def mode_serve(port, session_id):
                                 for c in calls[-64:]
                             ]
                             body = s
+                    body["workflow"] = _wf_payload()  # 仪表盘工作流面板数据
                     return self._send(json.dumps(body, ensure_ascii=False))
                 return self._send(PAGE, "text/html; charset=utf-8")
             except (BrokenPipeError, ConnectionResetError):
