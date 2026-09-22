@@ -682,7 +682,7 @@ def mode_serve(port, session_id):
 
     sid, path = resolve_session(session_id)
     turn_cache = usage_db.TurnCache(ttl=1.5)
-    live_cache = {"at": 0.0, "data": None}
+    live_cache = {}   # scope 会话 id -> {"at", "data"}（每窗口一个实时轮缓存）
     activity = {"at": time.time()}
 
     # 流式瞬时速率：轮询最新流式部件的字符增量换算 tok/s；
@@ -700,33 +700,39 @@ def mode_serve(port, session_id):
         "calib": _calib, "last_out": -1, "last_chars_total": -1,
     }
 
-    # 工作流子代理实时块：workflow_live() 聚合 + 逐个活跃子会话的流式字符增量
-    # 估算瞬时速率（与主 stream 共用同一 chars/token 校准比）。
-    wf_cache = {"at": 0.0, "data": []}
+    # 工作流子代理实时块：workflow_live() 按主会话聚合 + 逐个活跃子会话的流式
+    # 字符增量估算瞬时速率（与主 stream 共用同一 chars/token 校准比）。
+    # scope 未解析（渲染层没报 cid）时不返回工作流数据——宁可少显示也不串台。
+    wf_cache = {}     # scope 会话 id -> {"at", "data"}
     wf_stream = {}
 
-    def _wf_payload():
-        if time.time() - wf_cache["at"] > 1.0:
+    def _wf_payload(scope):
+        c = wf_cache.setdefault(scope, {"at": 0.0, "data": []})
+        if len(wf_cache) > 8:  # 窗口数有限，防御性清理
+            for k in sorted(wf_cache, key=lambda k: wf_cache[k]["at"])[:-4]:
+                wf_cache.pop(k, None)
+        if time.time() - c["at"] > 1.0:
             data = []
-            try:
-                data = usage_db.workflow_live() or []
-            except Exception:
-                data = []
+            if scope:
+                try:
+                    data = usage_db.workflow_live(parent_session_id=scope) or []
+                except Exception:
+                    data = []
             now = time.time()
             seen = set()
             for run in data:
                 agg = 0.0
                 for a in run.get("per_actor", []):
-                    sid = a.get("session_id")
-                    if not sid:
+                    sid_a = a.get("session_id")
+                    if not sid_a:
                         continue
-                    seen.add(sid)
+                    seen.add(sid_a)
                     st = wf_stream.setdefault(
-                        sid, {"pid": None, "chars": 0, "ts": 0.0,
-                              "tps": None, "last_grow": 0.0}
+                        sid_a, {"pid": None, "chars": 0, "ts": 0.0,
+                                "tps": None, "last_grow": 0.0}
                     )
                     try:
-                        sc = usage_db.stream_chars(sid)
+                        sc = usage_db.stream_chars(sid_a)
                     except Exception:
                         sc = None
                     if sc:
@@ -745,14 +751,28 @@ def mode_serve(port, session_id):
                     if a.get("active") and st["tps"]:
                         agg += st["tps"]
                 run["agg_instant"] = round(agg, 1) if agg else None
-            for sid in [k for k in wf_stream if k not in seen]:
-                wf_stream.pop(sid, None)  # 运行结束/宽限过期：清理跟踪器
-            wf_cache["data"] = data
-            wf_cache["at"] = now
-        return wf_cache["data"]
+            for sid_a in [k for k in wf_stream if k not in seen]:
+                wf_stream.pop(sid_a, None)  # 运行结束/宽限过期：清理跟踪器
+            c["data"] = data
+            c["at"] = now
+        return c["data"]
 
-    def _live_payload():
-        lv = usage_db.live_turn()
+    # 渲染层报来的 cid（本窗口 DOM 的 data-turn-id）→ 会话 id，小缓存
+    cid_cache = {"at": 0.0, "map": {}}
+
+    def _scope_of_cid(cid):
+        if not cid:
+            return None
+        now = time.time()
+        if now - cid_cache["at"] > 300:
+            cid_cache["map"].clear()
+            cid_cache["at"] = now
+        if cid not in cid_cache["map"]:
+            cid_cache["map"][cid] = usage_db.session_of_message(cid)
+        return cid_cache["map"][cid]
+
+    def _live_payload(scope):
+        lv = usage_db.live_turn(session_id=scope) if scope else usage_db.live_turn()
         now = time.time()
         st = stream
         if lv and lv.get("session_id"):
@@ -823,17 +843,30 @@ def mode_serve(port, session_id):
                     turns = turn_cache.get()[:limit]
                     return self._send(json.dumps({"turns": turns}, ensure_ascii=False))
                 if self.path.startswith("/live"):
-                    # 进行中轮次的实时数据（1s 缓存；注入脚本每秒轮询），
-                    # 含流式瞬时速率 instant_tps（字符增量换算，自动校准）
-                    # 与 workflow 块（运行中的工作流按子代理聚合，含逐代理瞬时速率）
-                    if time.time() - live_cache["at"] > 1.0:
+                    # 进行中轮次的实时数据（每会话 1s 缓存；注入脚本每秒轮询）。
+                    # cid = 渲染层上报的本窗口 data-turn-id（user 消息 id），服务端
+                    # 解析出会话后整套数据（实时行 + workflow 块）都限定在该会话内，
+                    # 多窗口/自动化并存时互不串显；cid 解析失败则不给工作流数据。
+                    from urllib.parse import unquote
+                    cid = ""
+                    if "cid=" in self.path:
                         try:
-                            live_cache["data"] = _live_payload()
+                            cid = unquote(self.path.split("cid=", 1)[1].split("&")[0])
+                        except ValueError:
+                            cid = ""
+                    scope = _scope_of_cid(cid)
+                    c = live_cache.setdefault(scope, {"at": 0.0, "data": None})
+                    if len(live_cache) > 8:
+                        for k in sorted(live_cache, key=lambda k: live_cache[k]["at"])[:-4]:
+                            live_cache.pop(k, None)
+                    if time.time() - c["at"] > 1.0:
+                        try:
+                            c["data"] = _live_payload(scope)
                         except Exception:
                             pass  # 查询失败沿用上次结果
-                        live_cache["at"] = time.time()
+                        c["at"] = time.time()
                     return self._send(json.dumps(
-                        {"live": live_cache["data"], "workflow": _wf_payload()},
+                        {"live": c["data"], "workflow": _wf_payload(scope)},
                         ensure_ascii=False))
                 if self.path.startswith("/healthz"):
                     return self._send("ok", "text/plain")
@@ -855,7 +888,8 @@ def mode_serve(port, session_id):
                                 for c in calls[-64:]
                             ]
                             body = s
-                    body["workflow"] = _wf_payload()  # 仪表盘工作流面板数据
+                    # 仪表盘工作流面板：同样限定在仪表盘所跟踪的会话内
+                    body["workflow"] = _wf_payload(cur_sid)
                     return self._send(json.dumps(body, ensure_ascii=False))
                 return self._send(PAGE, "text/html; charset=utf-8")
             except (BrokenPipeError, ConnectionResetError):

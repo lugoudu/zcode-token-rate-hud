@@ -4,12 +4,14 @@
  * 挂载方式：install 时在渲染层 index.html 加一行 <script defer src="file://…/ui/inject.js">，
  *           由 ZCode 渲染层在启动时加载（幂等闸防重复）。
  * 数据源：http://127.0.0.1:__PORT__/turns（本地只读服务，SQLite 用量库，口径=纯解码速率）、
- *         /live（进行中轮次 + workflow 块：运行中的工作流按子代理聚合）。
+ *         /live?cid=<本窗口 data-turn-id>（服务端解析成会话后，实时行与 workflow 块
+ *         都限定在本窗口的会话内——多窗口/后台自动化工作流并存时不串台）。
  * 定位锚：ZCode 每轮对话是 <section data-turn-id="…">（虚拟滚动，滚到哪渲染哪；
  *         运行中的轮次另有一个 data-v4-running-live-tail 元素，同选择器）。
  * 工作流：实时行末尾追加 ⟪ 工作流 活跃/总数 ⟫ 汇总段，其下另起第二行列出
  *         逐个子代理（名字 + ~瞬时速率 / ✓累计）；轮次结束后静态行补
  *         「工作流 N 代理 +Xk token」合计段（速率不并入主代理，避免并行失真）。
+ *         主轮已结束但工作流仍在后台跑时，明细行挂到最新一轮区块下继续刷新。
  * 设计约束：任何异常静默吞掉，绝不影响主界面；React 若删掉注入节点，observer 会重画。
  */
 (() => {
@@ -34,6 +36,31 @@
     const t = String(s || "");
     return t.length > 12 ? t.slice(0, 11) + "…" : t;
   };
+
+  // 本窗口的身份：取运行中节点（或最后一个 section）的 data-turn-id（本轮 user 消息 id），
+  // 报给 /live?cid= 由服务端解析成会话——实时行与工作流块都限定在本窗口的会话内，
+  // 多窗口/后台自动化工作流并存时不会串台。
+  function domCid() {
+    try {
+      const live = document.querySelector(`section[${LIVE_HOST_ATTR}], [data-turn-id][${LIVE_HOST_ATTR}]`);
+      if (live) return live.getAttribute("data-turn-id") || "";
+      const all = document.querySelectorAll("section[data-turn-id], [data-turn-id]");
+      return all.length ? all[all.length - 1].getAttribute("data-turn-id") || "" : "";
+    } catch {
+      return "";
+    }
+  }
+
+  // 清掉不在目标宿主里的旧工作流行（宿主切换/回收时防残留）
+  function sweepWfLines(host) {
+    try {
+      document.querySelectorAll(`[${WF_MARK}]`).forEach((el) => {
+        if (!host || !host.contains(el)) el.remove();
+      });
+    } catch {
+      /* 静默 */
+    }
+  }
 
   async function fetchTurns() {
     if (Date.now() - fetchedAt < CACHE_MS) return;
@@ -159,7 +186,7 @@
     let live = null;
     let wf = [];
     try {
-      const r = await fetch(`${API}/live?_=${Date.now()}`);
+      const r = await fetch(`${API}/live?cid=${encodeURIComponent(domCid())}&_=${Date.now()}`);
       const j = await r.json();
       live = j.live || null;
       wf = Array.isArray(j.workflow) ? j.workflow : [];
@@ -167,12 +194,21 @@
       /* 服务未起：静默 */
     }
     try {
-      const host = document.querySelector(`section[${LIVE_HOST_ATTR}], [data-turn-id][${LIVE_HOST_ATTR}]`);
+      let host = document.querySelector(`section[${LIVE_HOST_ATTR}], [data-turn-id][${LIVE_HOST_ATTR}]`);
+      // 无运行中节点但本会话的工作流仍在后台跑：挂到最新一轮的区块下继续显示
+      if (!host && wf.length) {
+        try {
+          const all = document.querySelectorAll("section[data-turn-id]");
+          if (all.length) host = all[all.length - 1];
+        } catch {
+          /* 静默 */
+        }
+      }
+      sweepWfLines(host);
       let line = host && host.querySelector(`[${LIVE_MARK}]`);
       let wfLine = host && host.querySelector(`[${WF_MARK}]`);
       if (!live && !wf.length) {
         if (line) line.remove();
-        if (wfLine) wfLine.remove();
         prevLen = 0;
         prevTs = 0;
         return;

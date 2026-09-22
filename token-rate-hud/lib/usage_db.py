@@ -181,9 +181,12 @@ def fold_turns(path=DB_PATH, limit=800, scan_limit=MODEL_SCAN_LIMIT):
     return out
 
 
-def live_turn(path=DB_PATH, max_age_s=1200):
+def live_turn(path=DB_PATH, max_age_s=1200, session_id=None):
     """当前进行中的轮：最新 main_turn 调用所属 turn，且尚未落入 turn_usage
     （turn_usage 在轮结束时才写行，进行中的轮只能从 model_usage 聚合）。
+
+    session_id 给定时整条链路（最新调用、最新 user 消息）都限定在该会话内——
+    多窗口/自动化并存时，每个窗口只看自己的轮，防止他窗数据串显。
 
     返回 None 或：
       {turn_id, msg_id, session_id, start_ms, now_ms, elapsed_ms, n_calls,
@@ -191,6 +194,8 @@ def live_turn(path=DB_PATH, max_age_s=1200):
 
     phase=1：本轮已有完成的模型调用（完整统计）；
     phase=0：提问已发出、首次调用尚未完成（只有开始时间，行先亮起来）。
+    首次调用进行中（尚无完成行、轮未落 turn_usage）也返回 phase=1 骨架行，
+    n_calls=0，由界面显示“首步生成中”。
     msg_id 桥 = 该会话最新一条 user 消息（轮未结束期间它就是本轮提问）。
     """
     import os
@@ -201,23 +206,27 @@ def live_turn(path=DB_PATH, max_age_s=1200):
     try:
         head = conn.execute(
             """SELECT turn_id, session_id, started_at FROM model_usage
-               WHERE query_source = 'main_turn'
-               ORDER BY started_at DESC LIMIT 1"""
+               WHERE query_source = 'main_turn' {sf}
+               ORDER BY started_at DESC LIMIT 1""".format(
+                sf="AND session_id = ?" if session_id else ""),
+            ((session_id,) if session_id else ()),
         ).fetchone()
         now_ms = int(_time.time() * 1000)
 
-        # phase 0 检测：全局最新一条 user 消息若（a）晚于最近一次 main_turn 调用、
+        # phase 0 检测：本会话最新一条 user 消息若（a）晚于最近一次 main_turn 调用、
         # （b）尚未被任何 turn_usage 消费、（c）足够新 —— 即为新会话首轮或老会话新一轮
         # 的“提问已发出、首步未完成”窗口，行先亮起来。
-        # 必须排除子代理会话：工作流/Agent 子代理的会话会持续写入自己的 user 消息，
-        # 否则全局最新 user 消息被其劫持，实时行计时错乱（实测发生过）。
+        # 必须排除子代理会话（未限定会话时）：工作流/Agent 子代理的会话会持续写入
+        # 自己的 user 消息，否则全局最新 user 消息被其劫持，实时行计时错乱（实测发生过）。
         try:
             lu = conn.execute(
                 """SELECT id, session_id, time_created FROM message
-                   WHERE json_extract(data, '$.role') = 'user'
+                   WHERE json_extract(data, '$.role') = 'user' {sf}
                      AND session_id NOT LIKE 'sess_dwf%'
                      AND session_id NOT LIKE 'sess_subagent%'
-                   ORDER BY time_created DESC LIMIT 1"""
+                   ORDER BY time_created DESC LIMIT 1""".format(
+                    sf="AND session_id = ?" if session_id else ""),
+                ((session_id,) if session_id else ()),
             ).fetchone()
         except sqlite3.Error:
             lu = None
@@ -257,8 +266,10 @@ def live_turn(path=DB_PATH, max_age_s=1200):
                ORDER BY started_at ASC""",
             (tid,),
         ).fetchall()
-        if not rows and not wf_running:
-            return None
+        if not rows:
+            # 首次调用进行中（尚无完成行）或纯工作流等待：出骨架行，界面显示“首步生成中”。
+            # 走到这里时 done 检查已排除已结束的轮，只剩进行中的情形。
+            rows = []
         start_ms = (rows[0][0] if rows else None) or last_started
         ttft = rows[0][2] if rows else None
         decode_ms = decode_tok = out_tok = 0
@@ -402,11 +413,14 @@ ORDER BY a.ordinal
 """
 
 
-def workflow_live(path=DB_PATH, recent_s=20, active_s=15, stale_guard_s=600, max_runs=4):
+def workflow_live(path=DB_PATH, recent_s=20, active_s=15, stale_guard_s=600,
+                  max_runs=8, parent_session_id=None):
     """进行中（或刚结束 recent_s 秒宽限内）的工作流运行，按子代理聚合。
 
     数据链：dwf_run(status/parent_session_id) → dwf_actor(名字/子会话)
             → model_usage(query_source='workflow_child')。
+    parent_session_id 给定时只返回该主会话的运行——多窗口/自动化并存时，
+    每个窗口只看自己发起的工作流，防止他窗数据串显。
     返回新→旧的运行列表（无则 []，旧版 ZCode 无 dwf 表也返回 []）：
       {run_id, run_name, parent_session_id, status, start_ms, update_ms,
        elapsed_ms, out_tokens, tps, actors, n_active,
@@ -430,11 +444,15 @@ def workflow_live(path=DB_PATH, recent_s=20, active_s=15, stale_guard_s=600, max
             """
             SELECT id, name, parent_session_id, status, time_created, time_updated
             FROM dwf_run
-            WHERE (status = 'running' AND time_updated >= ?)
-               OR (status != 'running' AND time_updated >= ?)
+            WHERE ({sf}status = 'running' AND time_updated >= ?)
+               OR ({sf}status != 'running' AND time_updated >= ?)
             ORDER BY time_updated DESC LIMIT ?
-            """,
-            (now_ms - stale_guard_s * 1000, now_ms - recent_s * 1000, max_runs),
+            """.format(sf="parent_session_id = ? AND " if parent_session_id else ""),
+            # 占位符顺序：(parent, t1) OR (parent, t2) LIMIT，会话参数和时间参数交错给两份
+            ((parent_session_id, now_ms - stale_guard_s * 1000,
+              parent_session_id, now_ms - recent_s * 1000, max_runs)
+             if parent_session_id else
+             (now_ms - stale_guard_s * 1000, now_ms - recent_s * 1000, max_runs)),
         ).fetchall()
         if not runs:
             return []
@@ -485,6 +503,40 @@ def workflow_live(path=DB_PATH, recent_s=20, active_s=15, stale_guard_s=600, max
         return out
     except sqlite3.Error:
         return []
+    finally:
+        conn.close()
+
+
+def session_of_message(cid, path=DB_PATH):
+    """消息 id（含截断前缀、带/不带 msg_ 前缀形态）→ 所属会话 id。失败返回 None。
+
+    渲染层把本窗口 DOM 里的 data-turn-id（即本轮 user 消息 id）报给 /live?cid=，
+    服务端据此把实时数据限定在该会话内——多窗口/自动化并存时互不串显。
+    """
+    import os
+
+    if not cid or not isinstance(cid, str) or len(cid) < 6:
+        return None
+    path = os.path.expanduser(path)
+    conn = _connect(path)
+    try:
+        for cand in (cid, "msg_" + cid):
+            r = conn.execute(
+                "SELECT session_id FROM message WHERE id = ?", (cand,)
+            ).fetchone()
+            if r:
+                return r[0]
+        if len(cid) >= 8:  # DOM 属性可能是截断版：退化为前缀匹配
+            for pfx in ("", "msg_"):
+                r = conn.execute(
+                    "SELECT session_id FROM message WHERE id LIKE ? LIMIT 1",
+                    (pfx + cid + "%",),
+                ).fetchone()
+                if r:
+                    return r[0]
+        return None
+    except sqlite3.Error:
+        return None
     finally:
         conn.close()
 
