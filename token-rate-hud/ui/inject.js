@@ -136,7 +136,7 @@
     if (t.tps) parts.push(`${fmtTps(t.tps)} tok/s`);
     if (SHOW_CTX && t.ctx_tokens) parts.push(`ctx ${fmtTok(t.ctx_tokens)}`);
     if (t.calls > 1) parts.push(`${t.calls} 次调用`);
-    if (t.wf_actors) parts.push(`工作流 ${t.wf_actors} 代理 +${fmtTok(t.wf_out_tokens)}`);
+    if (t.wf_actors) parts.push(`工作流 ${t.wf_actors} 代理 耗${fmtTok(t.wf_total_tokens || t.wf_out_tokens)} tok`);
     if (Array.isArray(t.models) && t.models.length) parts.push(t.models.join("/"));
     if (t.status && t.status !== "completed") parts.push("（已取消）");
     line.textContent = parts.join(" · ");
@@ -281,7 +281,9 @@
           const acts = (w.per_actor || []).slice(0, 8).map((a) => {
             if (a.instant_tps) return `${shortName(a.name)} ~${fmtTps(a.instant_tps)}`;
             if (a.active) return a.tps ? `${shortName(a.name)} ${fmtTps(a.tps)}` : `${shortName(a.name)} …`;
-            if (a.n_calls) return `${shortName(a.name)} ✓${fmtTok(a.out_tokens)}`;
+            // ✓ 后是总消耗（入+出，缓存读在输入侧）：编码类子代理输出仅占 ~1%，
+            // 只显示输出会“少得离谱”；显示总消耗才反映真实工作量
+            if (a.n_calls) return `${shortName(a.name)} ✓${fmtTok(a.total_tokens != null ? a.total_tokens : a.out_tokens)}`;
             return `${shortName(a.name)} …`;
           });
           segs.push(label + acts.join(" · "));

@@ -522,7 +522,7 @@ def mode_live():
                    else (fmt_rate(a["tps"]) if a.get("tps") else "--"))
             mark = "●" if a["active"] else "·"
             print(f"  {mark} {a['name']:<16} {seg:>9} tok/s   "
-                  f"{a['n_calls']:>3} 次 {fmt_tok(a['out_tokens'])} tok")
+                  f"{a['n_calls']:>3} 次 出{fmt_tok(a['out_tokens'])} 耗{fmt_tok(a.get('total_tokens') or 0)}")
     return 0
 
 
@@ -626,13 +626,14 @@ function renderWf(ws){
   let h='<div style="margin:10px 0 4px;font-weight:600">'+esc(w.run_name||w.run_id)
    +' <span class="dim">· '+st+' · '+w.n_active+'/'+w.actors+' 代理'
    +(w.agg_instant?' · ~'+r(w.agg_instant)+' tok/s':'')
-   +(w.tps?' · 累计 '+r(w.tps)+' tok/s':'')+' · '+f(w.out_tokens)+' tok</span></div>';
+   +(w.tps?' · 累计 '+r(w.tps)+' tok/s':'')
+   +' · 出 '+f(w.out_tokens)+' / 耗 '+f(w.total_tokens||0)+' tok</span></div>';
   h+=(w.per_actor||[]).map(a=>'<div class="wfrow"><span style="width:1em">'
    +(a.active?'●':'·')+'</span><span class="nm">'+esc(a.name)+'</span><span>'
    +(a.instant_tps?('~'+r(a.instant_tps)+' tok/s')
       :(a.active?(a.tps?(r(a.tps)+' tok/s'):'生成中…')
-        :(a.n_calls?('✓ '+f(a.out_tokens)+' tok'):'等待中')))
-   +'</span><span class="dim">'+a.n_calls+' 次 · '+f(a.out_tokens)+' tok'
+        :(a.n_calls?('✓ 耗 '+f(a.total_tokens!=null?a.total_tokens:a.out_tokens)+' tok'):'等待中')))
+   +'</span><span class="dim">'+a.n_calls+' 次 · 出 '+f(a.out_tokens)
    +(a.model?' · '+esc(a.model):'')+'</span></div>').join('');
   return h;
  }).join('');

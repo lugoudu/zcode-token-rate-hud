@@ -115,10 +115,13 @@ def fold_turns(path=DB_PATH, limit=800, scan_limit=MODEL_SCAN_LIMIT):
             ).fetchall()
             if wf_runs:
                 qm = ",".join("?" * len(wf_runs))
-                for rid, calls, out_tok, actors in conn.execute(
+                for rid, calls, out_tok, total_tok, actors in conn.execute(
                     f"""
                     SELECT a.run_id, COUNT(m.id),
                            COALESCE(SUM(m.output_tokens), 0),
+                           COALESCE(SUM(CASE WHEN m.computed_total_tokens IS NOT NULL
+                                         THEN m.computed_total_tokens
+                                         ELSE m.input_tokens + m.output_tokens END), 0),
                            COUNT(DISTINCT CASE WHEN m.id IS NOT NULL THEN a.session_id END)
                     FROM dwf_actor a
                     LEFT JOIN model_usage m
@@ -130,7 +133,7 @@ def fold_turns(path=DB_PATH, limit=800, scan_limit=MODEL_SCAN_LIMIT):
                     """,
                     [r[0] for r in wf_runs],
                 ):
-                    wf_agg[rid] = (calls, out_tok, actors)
+                    wf_agg[rid] = (calls, out_tok, total_tok, actors)
         except sqlite3.Error:
             wf_runs = []
     finally:
@@ -160,6 +163,7 @@ def fold_turns(path=DB_PATH, limit=800, scan_limit=MODEL_SCAN_LIMIT):
                 "wf_actors": 0,
                 "wf_calls": 0,
                 "wf_out_tokens": 0,
+                "wf_total_tokens": 0,
             }
         )
     # 工作流用量归属：运行创建时刻落在哪个主会话轮次的时间窗内（2s 宽限）。
@@ -167,7 +171,7 @@ def fold_turns(path=DB_PATH, limit=800, scan_limit=MODEL_SCAN_LIMIT):
     for rid, parent, created in wf_runs:
         if not created:
             continue
-        c, o, a = wf_agg.get(rid, (0, 0, 0))
+        c, o, tot, a = wf_agg.get(rid, (0, 0, 0, 0))
         if not (c or o):
             continue
         for t in out:
@@ -175,6 +179,7 @@ def fold_turns(path=DB_PATH, limit=800, scan_limit=MODEL_SCAN_LIMIT):
                 t["wf_runs"] += 1
                 t["wf_calls"] += c
                 t["wf_out_tokens"] += o
+                t["wf_total_tokens"] += tot
                 t["wf_actors"] += a
                 break
     out.sort(key=lambda t: t["end_ms"] or 0, reverse=True)
@@ -388,7 +393,9 @@ def _has_running_dwf(conn, session_id, now_ms, guard_s=600):
     return row is not None
 
 
-# 单个工作流运行的子代理聚合 SQL（LEFT JOIN 保证零调用的代理也占一行）
+# 单个工作流运行的子代理聚合 SQL（LEFT JOIN 保证零调用的代理也占一行）。
+# total = Σcomputed_total_tokens（每调用的入+出总消耗；GLM 通道 input 已含缓存读），
+# 优于只看 output——编码类子代理输出仅占消耗的 ~1%，缓存读大头在输入侧。
 _ACTOR_AGG_SQL = """
 SELECT a.name, a.session_id, a.resolved_model, a.ordinal,
        COUNT(m.id),
@@ -401,6 +408,9 @@ SELECT a.name, a.session_id, a.resolved_model, a.ordinal,
        COALESCE(SUM(CASE WHEN m.time_to_first_token_ms IS NOT NULL
                           AND m.output_tokens > 0
                      THEN m.output_tokens ELSE 0 END), 0),
+       COALESCE(SUM(CASE WHEN m.computed_total_tokens IS NOT NULL
+                     THEN m.computed_total_tokens
+                     ELSE m.input_tokens + m.output_tokens END), 0),
        MAX(m.model_id)
 FROM dwf_actor a
 LEFT JOIN model_usage m
@@ -467,7 +477,7 @@ def workflow_live(path=DB_PATH, recent_s=20, active_s=15, stale_guard_s=600,
             per_actor = []
             run_dec_ms = run_dec_tok = 0
             for (aname, sid, rmodel, _ord, n, out_tok, last_ms,
-                 dec_ms, dec_tok, model_id) in conn.execute(_ACTOR_AGG_SQL, (rid,)):
+                 dec_ms, dec_tok, total_tok, model_id) in conn.execute(_ACTOR_AGG_SQL, (rid,)):
                 model = model_id or (rmodel.rsplit("/", 1)[-1] if rmodel else None)
                 tps = (dec_tok * 1000.0 / dec_ms) if dec_ms > 0 else None
                 active = sid in running_rows or (
@@ -479,6 +489,7 @@ def workflow_live(path=DB_PATH, recent_s=20, active_s=15, stale_guard_s=600,
                     "session_id": sid,
                     "n_calls": n,
                     "out_tokens": out_tok,
+                    "total_tokens": total_tok,
                     "tps": round(tps, 2) if tps else None,
                     "active": bool(active),
                     "last_ms": last_ms,
@@ -495,6 +506,7 @@ def workflow_live(path=DB_PATH, recent_s=20, active_s=15, stale_guard_s=600,
                 "update_ms": updated,
                 "elapsed_ms": max(0, now_ms - (created or now_ms)),
                 "out_tokens": sum(a["out_tokens"] for a in per_actor),
+                "total_tokens": sum(a["total_tokens"] for a in per_actor),
                 "tps": tps_all,
                 "actors": len(per_actor),
                 "n_active": sum(1 for a in per_actor if a["active"]),
