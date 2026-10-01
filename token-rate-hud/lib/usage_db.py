@@ -7,10 +7,11 @@ usage_db.py —— ZCode 本地用量库（SQLite）只读折叠层
   - turn_usage  ：按轮聚合（含 user_message_id，作为界面 section[data-turn-id] 的桥）
   - model_usage ：按次调用明细（含 time_to_first_token_ms，用于剔除首包等待的纯解码速率）
 
-口径（对齐 DeepSeek 风格，优于按总时长平均的粗口径）：
+口径：
   - run_ms  = MAX(completed_at) - MIN(started_at)   整轮墙钟，含工具执行时段
   - ttft_ms = 本轮最早发起那一步的首 token 延迟
-  - tps     = Σoutput_tokens ÷ Σ(duration_ms - ttft_ms)  仅计两值齐备的步（纯解码速率）
+  - tps_e2e = Σoutput_tokens ÷ run_ms  端到端速率（含首包等待与工具执行时段，页脚主展示）
+  - tps     = Σoutput_tokens ÷ Σ(duration_ms - ttft_ms)  仅计两值齐备的步（纯解码速率，参考值）
   - models  = 本轮用过的模型（去重，斜杠拼接用）
   - ctx     = 本轮最后一次 main_turn 调用的上下文占用近似值
 
@@ -47,7 +48,7 @@ def fold_turns(path=DB_PATH, limit=800, scan_limit=MODEL_SCAN_LIMIT):
     """
     返回按 end_ms 降序的轮列表：
       {turn_id, msg_id, session_id, status, start_ms, end_ms, run_ms,
-       ttft_ms, tps, out_tokens, models, ctx_tokens}
+       ttft_ms, tps_e2e, tps, out_tokens, models, ctx_tokens}
     """
     import os
     path = os.path.expanduser(path)
@@ -144,6 +145,11 @@ def fold_turns(path=DB_PATH, limit=800, scan_limit=MODEL_SCAN_LIMIT):
         completed = completed or started
         decode_ms, decode_tok = dec.get(tid, (0, 0))
         tps = (decode_tok * 1000.0 / decode_ms) if decode_ms > 0 else None
+        run_ms = max(0, (completed or 0) - (started or 0))
+        # 端到端分子用整轮总输出（turn_usage 口径）：ttft 为 NULL 的步算不出解码
+        # 速率，但其输出确属整轮产出，墙钟也覆盖它们，不能只计 ttft 齐备的步
+        shown_out = out_tok or decode_tok or 0
+        tps_e2e = (shown_out * 1000.0 / run_ms) if run_ms > 0 else None
         out.append(
             {
                 "turn_id": tid,
@@ -152,10 +158,11 @@ def fold_turns(path=DB_PATH, limit=800, scan_limit=MODEL_SCAN_LIMIT):
                 "status": status,
                 "start_ms": started,
                 "end_ms": completed,
-                "run_ms": max(0, (completed or 0) - (started or 0)),
+                "run_ms": run_ms,
                 "ttft_ms": ttft,
                 "tps": round(tps, 2) if tps else None,
-                "out_tokens": decode_tok or (out_tok or 0),
+                "tps_e2e": round(tps_e2e, 2) if tps_e2e else None,
+                "out_tokens": shown_out,
                 "calls": calls_by_turn.get(tid, 0),
                 "models": models_by_turn.get(tid, []),
                 "ctx_tokens": ctx_by_turn.get(tid),

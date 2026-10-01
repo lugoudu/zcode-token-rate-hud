@@ -1392,12 +1392,13 @@ def mode_footer(limit):
     if not turns:
         print("（暂无用量的轮次数据）")
         return 0
-    print(f"{'完成时间':<20}{'用时':>9}{'首token':>9}{'tok/s':>8}{'出tok':>8}{'ctx':>8}  状态/模型")
+    print(f"{'完成时间':<20}{'用时':>9}{'首token':>9}{'端到端':>8}{'出tok':>8}{'ctx':>8}  状态/模型")
     for t in turns:
         ts = datetime.fromtimestamp((t["end_ms"] or 0) / 1000).strftime("%m-%d %H:%M:%S")
         ttft = f"{t['ttft_ms'] / 1000:.1f}s" if t["ttft_ms"] else "-"
+        e2e = t.get("tps_e2e") or t.get("tps")
         print(f"{ts:<20}{fmt_dur((t['run_ms'] or 0) / 1000):>9}{ttft:>9}"
-              f"{(fmt_rate(t['tps']) if t['tps'] else '-'):>8}{fmt_tok(t['out_tokens']):>8}"
+              f"{(fmt_rate(e2e) if e2e else '-'):>8}{fmt_tok(t['out_tokens']):>8}"
               f"{(fmt_tok(t['ctx_tokens']) if t['ctx_tokens'] else '-'):>8}  "
               f"{t['status']}/{'/'.join(t['models']) or '-'}")
     return 0

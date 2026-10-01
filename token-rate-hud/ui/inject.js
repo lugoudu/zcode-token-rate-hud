@@ -1,9 +1,10 @@
 /**
- * token-rate-hud 界面页脚注入脚本（DeepSeek 风格：`15:40 · 用时 7分40秒 · 首 token 7秒 · 49 tok/s · GLM-5.3`）
+ * token-rate-hud 界面页脚注入脚本（`15:40 · 用时 7分40秒 · 首 token 7秒 · 端到端 49 tok/s · GLM-5.3`）
  *
  * 挂载方式：install 时在渲染层 index.html 加一行 <script defer src="file://…/ui/inject.js">，
  *           由 ZCode 渲染层在启动时加载（幂等闸防重复）。
- * 数据源：http://127.0.0.1:__PORT__/turns（本地只读服务，SQLite 用量库，口径=纯解码速率）、
+ * 数据源：http://127.0.0.1:__PORT__/turns（本地只读服务，SQLite 用量库，口径=端到端速率：
+ *         出 token ÷ 整轮墙钟，含首包等待与工具执行时段）、
  *         /live?cid=<本窗口 data-turn-id>（服务端解析成会话后，实时行与 workflow 块
  *         都限定在本窗口的会话内——多窗口/后台自动化工作流并存时不串台）。
  * 定位锚：ZCode 每轮对话是 <section data-turn-id="…">（虚拟滚动，滚到哪渲染哪；
@@ -133,7 +134,10 @@
     line.setAttribute(MARK, "1");
     const parts = [fmtStamp(t.end_ms), `用时 ${fmtDur(t.run_ms)}`];
     if (t.ttft_ms != null && t.ttft_ms >= 0) parts.push(`首 token ${fmtLat(t.ttft_ms)}秒`);
-    if (t.tps) parts.push(`${fmtTps(t.tps)} tok/s`);
+    // 端到端速率 = 本轮出 token ÷ 整轮墙钟（含首包等待与工具执行时段）；
+    // 旧数据服务无 tps_e2e 字段时退化为解码速率，保证升级间隙不至于空缺
+    const e2e = t.tps_e2e || t.tps;
+    if (e2e) parts.push(`端到端 ${fmtTps(e2e)} tok/s`);
     if (SHOW_CTX && t.ctx_tokens) parts.push(`ctx ${fmtTok(t.ctx_tokens)}`);
     if (t.calls > 1) parts.push(`${t.calls} 次调用`);
     if (t.wf_actors) parts.push(`工作流 ${t.wf_actors} 代理 耗${fmtTok(t.wf_total_tokens || t.wf_out_tokens)} tok`);

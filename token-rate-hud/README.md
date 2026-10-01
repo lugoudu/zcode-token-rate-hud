@@ -5,10 +5,10 @@
 - **每条回答下面多一行小字**，比如：
 
   ```
-  15:09 · 用时 2分32秒 · 首 token 6.9秒 · 68 tok/s · ctx 155.7k · GLM-5.3
+  15:09 · 用时 2分32秒 · 首 token 6.9秒 · 端到端 45 tok/s · ctx 155.7k · GLM-5.3
   ```
 
-  翻译成人话：这轮回答花了 2 分半，模型“开口”等了 6.9 秒，吐字速度 68 token/秒，这轮对话已经吃掉 15.6 万 token 的“记忆容量”，用的是 GLM-5.3。往回翻历史回答，每条都会自动补上这行。
+  翻译成人话：这轮回答花了 2 分半，模型“开口”等了 6.9 秒，把等待首包、执行工具的时间全算进分母，整轮平均每秒产出 45 个 token，这轮对话已经吃掉 15.6 万 token 的“记忆容量”，用的是 GLM-5.3。往回翻历史回答，每条都会自动补上这行。
 
 - **回答还在生成的时候**，这行字会实时跳动：
 
@@ -82,11 +82,11 @@ ZCode 干活时，每一次“想一下”（模型调用）都会在你电脑�
 |---|---|
 | 用时 | 整轮墙钟 `MAX(completed_at) − MIN(started_at)`，含工具执行时段 |
 | 首 token | 本轮最早发起那一步的 TTFT |
-| tok/s（页脚） | `Σoutput_tokens ÷ Σ(duration_ms − ttft_ms)`——剔除首包等待的纯解码速率 |
+| 端到端 tok/s（页脚） | `Σoutput_tokens ÷ run_ms`（整轮墙钟）——含首包等待与工具执行时段的端到端速率；纯解码口径 `Σout ÷ Σ(duration_ms − ttft_ms)` 仍随 `/turns` 的 `tps` 字段下发，作参考不展示 |
 | tok/s（实时 ~） | 渲染层每秒测界面文本字符增速 × chars/token 校准比（EMA，随调用完成自动校准，持久化于 `ui/calib.json`）；仅在流式输出时显示 |
 | 模型 | 本轮用过的模型，多个用 `/` 拼接 |
 | ctx | 本轮最后一次调用的上下文占用（`computed_total_tokens`） |
-| 出速率（报告） | 最近一次调用 `outputTokens ÷ durationMs`（含首包等待，略低于页脚口径） |
+| 出速率（报告） | 最近一次调用 `outputTokens ÷ durationMs`（含首包等待，不含工具时段） |
 
 过滤：`model_usage` 只取 `status='completed'` 且 `query_source='main_turn'`（排除标题生成等旁路调用与失败重试）。GLM 通道的 `inputTokens` 含缓存读、Anthropic 风格不含，按 `inputTokens >= cacheReadTokens` 自适应去重。
 
