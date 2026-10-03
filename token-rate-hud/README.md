@@ -82,7 +82,7 @@ ZCode 干活时，每一次“想一下”（模型调用）都会在你电脑�
 |---|---|
 | 用时 | 整轮墙钟 `MAX(completed_at) − MIN(started_at)`，含工具执行时段 |
 | 首 token | 本轮最早发起那一步的 TTFT |
-| 端到端 tok/s（页脚） | `Σoutput_tokens ÷ run_ms`（整轮墙钟）——含首包等待与工具执行时段的端到端速率；纯解码口径 `Σout ÷ Σ(duration_ms − ttft_ms)` 仍随 `/turns` 的 `tps` 字段下发，作参考不展示 |
+| 端到端 tok/s（页脚） | `Σoutput_tokens ÷ run_ms`（整轮墙钟）——含首包等待与工具执行时段；字段缺失或整轮时长异常时不冒充，退化解码均值并如实改标「首输出后」。参考值 `tps`（`/turns` 下发、界面不展示）为 `Σout ÷ Σ(duration − ttft)`，分子分母同有效样本条件（ttft 齐备且 `duration > ttft`），无效调用两侧同剔 |
 | tok/s（实时 ~） | 渲染层每秒测界面文本字符增速 × chars/token 校准比（EMA，随调用完成自动校准，持久化于 `ui/calib.json`）；仅在流式输出时显示 |
 | 模型 | 本轮用过的模型，多个用 `/` 拼接 |
 | ctx | 本轮最后一次调用的上下文占用（`computed_total_tokens`） |

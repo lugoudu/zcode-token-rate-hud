@@ -37,7 +37,10 @@ tokrate.py —— ZCode token 速率核心库与 CLI（token-rate-hud 插件）
 
 口径说明：部分通道（GLM 编程套餐）的 inputTokens 已包含 cacheReadTokens，
 部分通道（Anthropic 风格）则不包含。本工具按 “inputTokens >= cacheReadTokens
-则视为包含” 自适应，入速率与 ctx 估算均使用去重后的有效入 token。
+则视为包含” 自适应——这是数值启发式，无法区分“总输入 100 含缓存 80”与
+“非缓存 100 另有缓存 80”两种协议语义，后者会低估输入。会话累计直接使用
+归一后的输入总数（缓存读作为其中细分单列，不再叠加双计）。入速率与 ctx
+估算使用去重后的有效入 token。
 """
 
 import fcntl
@@ -347,7 +350,8 @@ def stats_for(calls, totals, session_id):
         "rolling": {"rate": win_out / win_dur, "out": win_out, "n": len(win)},
         "totals": {
             "n": totals["n"], "out": totals["out"],
-            "in": totals["in"] + totals["cr"], "cr": totals["cr"],
+            # totals["in"] 已是口径归一后的输入总数（GLM 通道含缓存读），再加 cr 会双计
+            "in": totals["in"], "cr": totals["cr"],
             "gen": totals["dur"],
             "avg": totals["out"] / total_gen,
         },
@@ -577,7 +581,7 @@ def mode_report(session_id, n_turns, n_calls):
 
     t = s["totals"]
     print(f"\n会话累计：出 {fmt_tok(t['out'])} · 入 {fmt_tok(t['in'])}（缓存读 {fmt_tok(t['cr'])}）· "
-          f"纯生成 {fmt_dur(t['gen'])} · 整体出速率 {fmt_rate(t['avg'])} tok/s")
+          f"累计模型调用 {fmt_dur(t['gen'])} · 调用均值出速率 {fmt_rate(t['avg'])} tok/s")
     print(f"上下文占用：约 {fmt_tok(s['ctx']['tokens'])}" +
           (f" / {fmt_tok(s['ctx']['max'])}（{s['ctx']['pct']}%）" if s['ctx']['pct'] is not None else ""))
     return 0
@@ -601,7 +605,7 @@ PAGE = """<!doctype html><html lang="zh"><head><meta charset="utf-8">
  .wfrow .nm{min-width:10em}
  .dim{color:#8a97a3}
 </style></head><body>
-<div class="big"><span id="rate">--</span><span class="unit">tok/s 出</span></div>
+<div class="big"><span id="rate">--</span><span class="unit">tok/s 出（最近调用均值）</span></div>
 <div class="row">
  <div class="card"><div class="k">入速率（当前调用）</div><div class="v" id="rin">--</div></div>
  <div class="card"><div class="k">本轮均值 / 峰值</div><div class="v" id="turn">--</div></div>
@@ -687,7 +691,9 @@ def mode_serve(port, session_id):
     activity = {"at": time.time()}
 
     # 流式瞬时速率：轮询最新流式部件的字符增量换算 tok/s；
-    # chars/token 比随调用完成自动校准（EMA），持久化在 ui/calib.json
+    # chars/token 比随调用完成自动校准（EMA），持久化在 ui/calib.json。
+    # 采样状态按会话隔离：多窗口/自动化并存时互不串台，切换会话时瞬时值
+    # 清零重测，不残留上一会话的速率或校准基线。
     calib_path = os.path.join(UI_DIR, "calib.json")
     try:
         _c = json.load(open(calib_path))
@@ -696,10 +702,17 @@ def mode_serve(port, session_id):
         _calib = 0.0
     if not 0.8 <= _calib <= 6.0:
         _calib = 2.4  # 中英混排默认值，几步调用后即被实测校准
-    stream = {
-        "pid": None, "chars": 0, "ts": 0.0, "tps": None, "last_grow": 0.0,
-        "calib": _calib, "last_out": -1, "last_chars_total": -1,
-    }
+    calib = {"v": _calib}
+    streams = {}  # 会话 id -> {pid, chars, ts, tps, last_grow, last_out, last_chars_total}
+
+    def _stream_state(sid):
+        if len(streams) > 16:  # 防御性清理：只留最近活跃的会话状态
+            for k in sorted(streams, key=lambda k: streams[k]["last_grow"])[:-8]:
+                streams.pop(k, None)
+        return streams.setdefault(sid, {
+            "pid": None, "chars": 0, "ts": 0.0, "tps": None, "last_grow": 0.0,
+            "last_out": -1, "last_chars_total": -1,
+        })
 
     # 工作流子代理实时块：workflow_live() 按主会话聚合 + 逐个活跃子会话的流式
     # 字符增量估算瞬时速率（与主 stream 共用同一 chars/token 校准比）。
@@ -740,7 +753,7 @@ def mode_serve(port, session_id):
                         if sc[0] == st["pid"]:
                             if sc[1] > st["chars"] and now - st["ts"] >= 0.5:
                                 cps = (sc[1] - st["chars"]) / (now - st["ts"])
-                                st["tps"] = round(cps / stream["calib"], 1)
+                                st["tps"] = round(cps / calib["v"], 1)
                                 st["last_grow"] = now
                         else:
                             st["pid"], st["chars"], st["ts"] = sc[0], sc[1], now
@@ -775,7 +788,7 @@ def mode_serve(port, session_id):
     def _live_payload(scope):
         lv = usage_db.live_turn(session_id=scope) if scope else usage_db.live_turn()
         now = time.time()
-        st = stream
+        st = _stream_state(lv["session_id"]) if lv and lv.get("session_id") else None
         if lv and lv.get("session_id"):
             try:
                 sc = usage_db.stream_chars(lv["session_id"])
@@ -785,7 +798,7 @@ def mode_serve(port, session_id):
                 if sc[0] == st["pid"]:
                     if sc[1] > st["chars"] and now - st["ts"] >= 0.5:
                         cps = (sc[1] - st["chars"]) / (now - st["ts"])
-                        st["tps"] = round(cps / st["calib"], 1)
+                        st["tps"] = round(cps / calib["v"], 1)
                         st["last_grow"] = now
                 else:
                     st["pid"], st["chars"], st["ts"] = sc[0], sc[1], now
@@ -804,18 +817,16 @@ def mode_serve(port, session_id):
                             and lv["out_tokens"] - st["last_out"] >= 50:
                         ratio = (tot - st["last_chars_total"]) / (lv["out_tokens"] - st["last_out"])
                         if 0.8 <= ratio <= 6.0:
-                            st["calib"] = round(st["calib"] * 0.7 + ratio * 0.3, 3)
+                            calib["v"] = round(calib["v"] * 0.7 + ratio * 0.3, 3)
                             try:
-                                json.dump({"chars_per_token": st["calib"]}, open(calib_path, "w"))
+                                json.dump({"chars_per_token": calib["v"]}, open(calib_path, "w"))
                             except OSError:
                                 pass
                     st["last_chars_total"] = tot
                 st["last_out"] = lv["out_tokens"]
-        else:
-            st["tps"], st["pid"] = None, None
         if lv:
-            lv["instant_tps"] = st["tps"]
-            lv["calib"] = st["calib"]  # 渲染层字符→token 换算比（自动校准）
+            lv["instant_tps"] = st["tps"] if st else None
+            lv["calib"] = calib["v"]  # 渲染层字符→token 换算比（自动校准）
         return lv
 
     class H(BaseHTTPRequestHandler):
@@ -842,7 +853,7 @@ def mode_serve(port, session_id):
                         except ValueError:
                             pass
                     turns = turn_cache.get()[:limit]
-                    return self._send(json.dumps({"turns": turns}, ensure_ascii=False))
+                    return self._send(json.dumps({"turns": turns, "schema": 3}, ensure_ascii=False))
                 if self.path.startswith("/live"):
                     # 进行中轮次的实时数据（每会话 1s 缓存；注入脚本每秒轮询）。
                     # cid = 渲染层上报的本窗口 data-turn-id（user 消息 id），服务端
@@ -1392,13 +1403,14 @@ def mode_footer(limit):
     if not turns:
         print("（暂无用量的轮次数据）")
         return 0
-    print(f"{'完成时间':<20}{'用时':>9}{'首token':>9}{'端到端':>8}{'出tok':>8}{'ctx':>8}  状态/模型")
+    print(f"{'完成时间':<20}{'用时':>9}{'首token':>9}{'端到端':>8}{'首输出后':>9}{'出tok':>8}{'ctx':>8}  状态/模型")
     for t in turns:
         ts = datetime.fromtimestamp((t["end_ms"] or 0) / 1000).strftime("%m-%d %H:%M:%S")
         ttft = f"{t['ttft_ms'] / 1000:.1f}s" if t["ttft_ms"] else "-"
-        e2e = t.get("tps_e2e") or t.get("tps")
+        e2e = t.get("tps_e2e")  # 缺失显式留空，不拿解码均值冒充端到端
+        dec = t.get("tps")
         print(f"{ts:<20}{fmt_dur((t['run_ms'] or 0) / 1000):>9}{ttft:>9}"
-              f"{(fmt_rate(e2e) if e2e else '-'):>8}{fmt_tok(t['out_tokens']):>8}"
+              f"{(fmt_rate(e2e) if e2e else '-'):>8}{(fmt_rate(dec) if dec else '-'):>9}{fmt_tok(t['out_tokens']):>8}"
               f"{(fmt_tok(t['ctx_tokens']) if t['ctx_tokens'] else '-'):>8}  "
               f"{t['status']}/{'/'.join(t['models']) or '-'}")
     return 0

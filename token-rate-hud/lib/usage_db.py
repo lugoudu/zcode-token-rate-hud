@@ -7,11 +7,13 @@ usage_db.py —— ZCode 本地用量库（SQLite）只读折叠层
   - turn_usage  ：按轮聚合（含 user_message_id，作为界面 section[data-turn-id] 的桥）
   - model_usage ：按次调用明细（含 time_to_first_token_ms，用于剔除首包等待的纯解码速率）
 
-口径：
+口径（页脚主展示为端到端速率；tps 仅作参考值随 /turns 下发、界面不展示）：
   - run_ms  = MAX(completed_at) - MIN(started_at)   整轮墙钟，含工具执行时段
   - ttft_ms = 本轮最早发起那一步的首 token 延迟
-  - tps_e2e = Σoutput_tokens ÷ run_ms  端到端速率（含首包等待与工具执行时段，页脚主展示）
-  - tps     = Σoutput_tokens ÷ Σ(duration_ms - ttft_ms)  仅计两值齐备的步（纯解码速率，参考值）
+  - tps_e2e = turn_usage 整轮输出 ÷ run_ms  端到端速率（含首包等待与工具执行时段）
+  - tps     = 有效调用 Σoutput ÷ Σ(duration_ms - ttft_ms)  首输出后调用均值（参考值）。
+              有效性判据分子分母同条件：ttft 非空、duration>ttft、输出>0，
+              无效样本两侧同剔，避免只进分子抬高均值
   - models  = 本轮用过的模型（去重，斜杠拼接用）
   - ctx     = 本轮最后一次 main_turn 调用的上下文占用近似值
 
@@ -31,9 +33,6 @@ import time
 
 DB_PATH = "~/.zcode/cli/db/db.sqlite"
 
-# 每轮折叠时最多回看的 model_usage 行数（覆盖上下文占用与解码时间的样本）
-MODEL_SCAN_LIMIT = 12000
-
 
 def _connect(path):
     return sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=3)
@@ -44,7 +43,7 @@ def db_available(path=DB_PATH):
     return os.path.exists(os.path.expanduser(path))
 
 
-def fold_turns(path=DB_PATH, limit=800, scan_limit=MODEL_SCAN_LIMIT):
+def fold_turns(path=DB_PATH, limit=800):
     """
     返回按 end_ms 降序的轮列表：
       {turn_id, msg_id, session_id, status, start_ms, end_ms, run_ms,
@@ -67,45 +66,52 @@ def fold_turns(path=DB_PATH, limit=800, scan_limit=MODEL_SCAN_LIMIT):
         ).fetchall()
         if not rows:
             return []
-        min_start = min(r[4] or 0 for r in rows)
+        turn_ids = [r[1] for r in rows]
 
         # 按轮折叠解码时间、模型列表，并抓每轮最后一次调用的上下文占用
-        # calls = 该轮已完成的主对话调用数（与实时行 n_calls 同口径）
+        # calls = 该轮已完成的主对话调用数（与实时行 n_calls 同口径）。
+        # 按轮次 ID 分块取全调用明细——不做时间窗行数上限，杜绝大库下
+        # 较新调用被静默截断（模型列表/ctx/解码参考值会随之失真）。
+        # 解码有效性分子分母同条件，无效调用两侧同剔。
+        _VALID = """time_to_first_token_ms IS NOT NULL
+                    AND duration_ms IS NOT NULL
+                    AND duration_ms - time_to_first_token_ms > 0
+                    AND output_tokens > 0"""
         dec = {}
         calls_by_turn = {}
         models_by_turn = {}
         ctx_by_turn = {}
-        for turn_id, model_id, started, decode_ms, decode_tok, ctx in conn.execute(
-            """
-            SELECT turn_id, model_id, started_at,
-                   CASE WHEN time_to_first_token_ms IS NOT NULL
-                             AND duration_ms - time_to_first_token_ms > 0
-                             AND output_tokens > 0
-                        THEN duration_ms - time_to_first_token_ms ELSE 0 END,
-                   CASE WHEN time_to_first_token_ms IS NOT NULL AND output_tokens > 0
-                        THEN output_tokens ELSE 0 END,
-                   computed_total_tokens
-            FROM model_usage
-            WHERE status = 'completed' AND query_source = 'main_turn'
-              AND started_at >= ?
-            ORDER BY started_at ASC
-            LIMIT ?
-            """,
-            (min_start, scan_limit),
-        ):
-            d, tok = dec.get(turn_id, (0, 0))
-            dec[turn_id] = (d + (decode_ms or 0), tok + (decode_tok or 0))
-            calls_by_turn[turn_id] = calls_by_turn.get(turn_id, 0) + 1
-            if model_id:
-                lst = models_by_turn.setdefault(turn_id, [])
-                if model_id not in lst:
-                    lst.append(model_id)
-            if ctx is not None:
-                ctx_by_turn[turn_id] = ctx  # 后写覆盖，最终为本轮最后一次
+        for i in range(0, len(turn_ids), 400):
+            chunk = turn_ids[i:i + 400]
+            qm = ",".join("?" * len(chunk))
+            for turn_id, model_id, started, decode_ms, decode_tok, ctx in conn.execute(
+                f"""
+                SELECT turn_id, model_id, started_at,
+                       CASE WHEN {_VALID}
+                            THEN duration_ms - time_to_first_token_ms ELSE 0 END,
+                       CASE WHEN {_VALID} THEN output_tokens ELSE 0 END,
+                       computed_total_tokens
+                    FROM model_usage
+                    WHERE turn_id IN ({qm})
+                      AND status = 'completed' AND query_source = 'main_turn'
+                    ORDER BY started_at ASC
+                    """,
+                chunk,
+            ):
+                d, tok = dec.get(turn_id, (0, 0))
+                dec[turn_id] = (d + (decode_ms or 0), tok + (decode_tok or 0))
+                calls_by_turn[turn_id] = calls_by_turn.get(turn_id, 0) + 1
+                if model_id:
+                    lst = models_by_turn.setdefault(turn_id, [])
+                    if model_id not in lst:
+                        lst.append(model_id)
+                if ctx is not None:
+                    ctx_by_turn[turn_id] = ctx  # 后写覆盖，最终为本轮最后一次
 
         # 工作流子代理归并备料：dwf_run → dwf_actor → model_usage(workflow_child)
         # 两次批量查询拿到「哪个主会话的哪段时间窗里跑了哪些工作流用量」，
         # 旧版 ZCode 无 dwf_* 表时整段跳过（静默，不影响主口径）。
+        min_start = min(r[4] or 0 for r in rows)
         wf_runs = []
         wf_agg = {}
         try:
@@ -413,6 +419,8 @@ SELECT a.name, a.session_id, a.resolved_model, a.ordinal,
                           AND m.output_tokens > 0
                      THEN m.duration_ms - m.time_to_first_token_ms ELSE 0 END), 0),
        COALESCE(SUM(CASE WHEN m.time_to_first_token_ms IS NOT NULL
+                          AND m.duration_ms IS NOT NULL
+                          AND m.duration_ms - m.time_to_first_token_ms > 0
                           AND m.output_tokens > 0
                      THEN m.output_tokens ELSE 0 END), 0),
        COALESCE(SUM(CASE WHEN m.computed_total_tokens IS NOT NULL
@@ -444,8 +452,10 @@ def workflow_live(path=DB_PATH, recent_s=20, active_s=15, stale_guard_s=600,
        per_actor: [{name, model, session_id, n_calls, out_tokens, tps,
                     active, last_ms}]}
 
-    口径：tps = Σ输出token ÷ Σ(duration−ttft)。各代理解码时段求和，
-    即并行流的合计吐字吞吐（用户要看的“总共跑多快”），非墙钟速率。
+    口径：tps = Σ输出token ÷ Σ(duration−ttft)，分子分母同有效样本条件
+    （ttft 齐备且 duration>ttft，无效调用两侧同剔）。这是按时长加权的调用均值，
+    不是并行流的合计吞吐——合计吞吐须按共同观察窗口内到达的 token 另算，
+    此处不提供。
     active 判据 = 最近 active_s 秒内有子调用完成，或存在 status='running'
     的子调用行。running 但 time_updated 超过 stale_guard_s 的运行视为
     宿主已死，不返回。
