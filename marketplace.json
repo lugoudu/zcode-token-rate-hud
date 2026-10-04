@@ -10,7 +10,7 @@
       "name": "token-rate-hud",
       "source": "./token-rate-hud",
       "description": "回答页脚实时显示 token 速率（用时 · 首 token · 端到端 tok/s · 模型 · ctx，流式生成时逐秒刷新）。工作流子代理实时可见：运行中显示 ⟪ 工作流 ⟫ 汇总与逐代理速率明细，轮次结束合计并入页脚。全部展示在界面层，零上下文注入；含 /token-rate 报告与实时仪表盘。",
-      "version": "1.6.4",
+      "version": "1.6.5",
       "category": "productivity",
       "keywords": [
         "token-rate",

@@ -11,6 +11,11 @@ usage_db.py —— ZCode 本地用量库（SQLite）只读折叠层
   - run_ms  = MAX(completed_at) - MIN(started_at)   整轮墙钟，含工具执行时段
   - ttft_ms = 本轮最早发起那一步的首 token 延迟
   - tps_e2e = turn_usage 整轮输出 ÷ run_ms  端到端速率（含首包等待与工具执行时段）
+  - wait_ms = 轮内时间线上工具开始执行前的空闲段合计（单段 ≥ WAIT_GAP_MIN_MS 才计，
+              滤除毫秒级调度噪声）。数据源 tool_usage.started_at 是工具实际开跑时刻
+              （用户确认之后），空档即等待：主要为权限确认等待，也含后台任务轮询
+              等其他空闲；AskUserQuestion 的用户思考时间在工具时长内，不在其中
+  - tps_e2e_active = 整轮输出 ÷ (run_ms - wait_ms)  剔等待端到端（页脚优先展示）
   - tps     = 有效调用 Σoutput ÷ Σ(duration_ms - ttft_ms)  首输出后调用均值（参考值）。
               有效性判据分子分母同条件：ttft 非空、duration>ttft、输出>0，
               无效样本两侧同剔，避免只进分子抬高均值
@@ -33,6 +38,9 @@ import time
 
 DB_PATH = "~/.zcode/cli/db/db.sqlite"
 
+# 工具开始执行前的空闲段达到该值才计入 wait_ms（毫秒级调度噪声 5~30ms，放行即跑）
+WAIT_GAP_MIN_MS = 2000
+
 
 def _connect(path):
     return sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=3)
@@ -47,7 +55,7 @@ def fold_turns(path=DB_PATH, limit=800):
     """
     返回按 end_ms 降序的轮列表：
       {turn_id, msg_id, session_id, status, start_ms, end_ms, run_ms,
-       ttft_ms, tps_e2e, tps, out_tokens, models, ctx_tokens}
+       ttft_ms, wait_ms, tps_e2e, tps_e2e_active, tps, out_tokens, models, ctx_tokens}
     """
     import os
     path = os.path.expanduser(path)
@@ -73,6 +81,8 @@ def fold_turns(path=DB_PATH, limit=800):
         # 按轮次 ID 分块取全调用明细——不做时间窗行数上限，杜绝大库下
         # 较新调用被静默截断（模型列表/ctx/解码参考值会随之失真）。
         # 解码有效性分子分母同条件，无效调用两侧同剔。
+        # busy = 轮内忙碌时间线（模型调用 + 工具执行区间），用于剥离
+        # 工具开始前的等待空档（权限确认等待等）。
         _VALID = """time_to_first_token_ms IS NOT NULL
                     AND duration_ms IS NOT NULL
                     AND duration_ms - time_to_first_token_ms > 0
@@ -81,6 +91,7 @@ def fold_turns(path=DB_PATH, limit=800):
         calls_by_turn = {}
         models_by_turn = {}
         ctx_by_turn = {}
+        busy = {}  # turn_id -> [(start_ms, end_ms, is_tool), ...]
         for i in range(0, len(turn_ids), 400):
             chunk = turn_ids[i:i + 400]
             qm = ",".join("?" * len(chunk))
@@ -107,6 +118,41 @@ def fold_turns(path=DB_PATH, limit=800):
                         lst.append(model_id)
                 if ctx is not None:
                     ctx_by_turn[turn_id] = ctx  # 后写覆盖，最终为本轮最后一次
+            # 忙碌时间线：全部已完成调用（不限 main_turn——子代理/旁路调用同样
+            # 占用机器，不能被当等待扣除）+ 工具执行区间。工具的 started_at 是
+            # 实际开跑时刻（用户确认之后），它与上一活动结束之间的空档即等待。
+            # completed_at 为空的（罕见）用 duration_ms 兜底。
+            for turn_id, started, call_end in conn.execute(
+                f"""
+                SELECT turn_id, started_at, completed_at FROM model_usage
+                WHERE turn_id IN ({qm}) AND status = 'completed'
+                """,
+                chunk,
+            ):
+                busy.setdefault(turn_id, []).append((started, call_end or started, False))
+            for turn_id, t_start, t_end in conn.execute(
+                f"""
+                SELECT turn_id, started_at,
+                       COALESCE(completed_at, started_at + duration_ms, started_at)
+                    FROM tool_usage
+                    WHERE turn_id IN ({qm}) AND started_at IS NOT NULL
+                """,
+                chunk,
+            ):
+                busy.setdefault(turn_id, []).append((t_start, t_end, True))
+
+        def _wait_before_tools(intervals, min_gap_ms=WAIT_GAP_MIN_MS):
+            """合并时间线上，由工具开启的空闲段合计（并行工具贴着前一个跑，不重复计）。"""
+            wait = 0
+            prev_end = None
+            for s, e, is_tool in sorted(intervals, key=lambda x: x[0]):
+                e = max(e, s)
+                if prev_end is not None and is_tool and s - prev_end >= min_gap_ms:
+                    wait += s - prev_end
+                prev_end = e if prev_end is None else max(prev_end, e)
+            return wait
+
+        wait_by_turn = {tid: _wait_before_tools(iv) for tid, iv in busy.items()}
 
         # 工作流子代理归并备料：dwf_run → dwf_actor → model_usage(workflow_child)
         # 两次批量查询拿到「哪个主会话的哪段时间窗里跑了哪些工作流用量」，
@@ -156,6 +202,13 @@ def fold_turns(path=DB_PATH, limit=800):
         # 速率，但其输出确属整轮产出，墙钟也覆盖它们，不能只计 ttft 齐备的步
         shown_out = out_tok or decode_tok or 0
         tps_e2e = (shown_out * 1000.0 / run_ms) if run_ms > 0 else None
+        wait_ms = min(wait_by_turn.get(tid, 0), run_ms) if run_ms > 0 else 0  # 防御：不超过墙钟
+        active_ms = run_ms - wait_ms
+        # 剔等待值仅对「有主代理完成调用」的轮产出：纯工作流/子代理轮的
+        # 输出与净忙时不属于同一主体，剥出的速率无意义
+        _has_main = calls_by_turn.get(tid, 0) > 0
+        tps_e2e_active = (shown_out * 1000.0 / active_ms) \
+            if (_has_main and wait_ms > 0 and active_ms > 0) else None
         out.append(
             {
                 "turn_id": tid,
@@ -168,6 +221,8 @@ def fold_turns(path=DB_PATH, limit=800):
                 "ttft_ms": ttft,
                 "tps": round(tps, 2) if tps else None,
                 "tps_e2e": round(tps_e2e, 2) if tps_e2e else None,
+                "wait_ms": wait_ms,
+                "tps_e2e_active": round(tps_e2e_active, 2) if tps_e2e_active else None,
                 "out_tokens": shown_out,
                 "calls": calls_by_turn.get(tid, 0),
                 "models": models_by_turn.get(tid, []),

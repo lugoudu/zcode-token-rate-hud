@@ -136,11 +136,15 @@
     const parts = [fmtStamp(t.end_ms), `用时 ${fmtDur(t.run_ms)}`];
     if (t.ttft_ms != null && t.ttft_ms >= 0) parts.push(`首 token ${fmtLat(t.ttft_ms)}秒`);
     // 端到端速率 = 本轮出 token ÷ 整轮墙钟（含首包等待与工具执行时段）。
-    // 仅在 tps_e2e 有效时标「端到端」；缺失（旧服务/整轮时长异常）时不拿
-    // 解码均值冒充，改标「首输出后」——两种口径不共用一个标签
+    // 剔等待版（tps_e2e_active）从分母扣掉工具开始执行前的等待空档
+    // （权限确认等待等，单段 ≥2s 才计），有数据时优先展示；等待显著时
+    // 紧跟「剔等待Xs」注明，速率条不新增常驻元素。
+    // 两级口径缺失时都不拿解码均值冒充，如实改标「首输出后」
     const posNum = (v) => typeof v === "number" && isFinite(v) && v > 0;
-    if (posNum(t.tps_e2e)) parts.push(`端到端 ${fmtTps(t.tps_e2e)} tok/s`);
+    const e2e = posNum(t.tps_e2e_active) ? t.tps_e2e_active : t.tps_e2e;
+    if (posNum(e2e)) parts.push(`端到端 ${fmtTps(e2e)} tok/s`);
     else if (posNum(t.tps)) parts.push(`首输出后 ${fmtTps(t.tps)} tok/s`);
+    if (posNum(e2e) && t.wait_ms >= 5000) parts.push(`剔等待${fmtDur(t.wait_ms)}`);
     if (SHOW_CTX && t.ctx_tokens) parts.push(`ctx ${fmtTok(t.ctx_tokens)}`);
     if (t.calls > 1) parts.push(`${t.calls} 次调用`);
     if (t.wf_actors) parts.push(`工作流 ${t.wf_actors} 代理 耗${fmtTok(t.wf_total_tokens || t.wf_out_tokens)} tok`);

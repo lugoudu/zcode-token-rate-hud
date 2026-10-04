@@ -853,7 +853,7 @@ def mode_serve(port, session_id):
                         except ValueError:
                             pass
                     turns = turn_cache.get()[:limit]
-                    return self._send(json.dumps({"turns": turns, "schema": 3}, ensure_ascii=False))
+                    return self._send(json.dumps({"turns": turns, "schema": 4}, ensure_ascii=False))
                 if self.path.startswith("/live"):
                     # 进行中轮次的实时数据（每会话 1s 缓存；注入脚本每秒轮询）。
                     # cid = 渲染层上报的本窗口 data-turn-id（user 消息 id），服务端
@@ -1403,14 +1403,16 @@ def mode_footer(limit):
     if not turns:
         print("（暂无用量的轮次数据）")
         return 0
-    print(f"{'完成时间':<20}{'用时':>9}{'首token':>9}{'端到端':>8}{'首输出后':>9}{'出tok':>8}{'ctx':>8}  状态/模型")
+    print(f"{'完成时间':<20}{'用时':>9}{'首token':>9}{'端到端':>8}{'剔等待':>8}{'首输出后':>9}{'出tok':>8}{'ctx':>8}  状态/模型")
     for t in turns:
         ts = datetime.fromtimestamp((t["end_ms"] or 0) / 1000).strftime("%m-%d %H:%M:%S")
         ttft = f"{t['ttft_ms'] / 1000:.1f}s" if t["ttft_ms"] else "-"
-        e2e = t.get("tps_e2e")  # 缺失显式留空，不拿解码均值冒充端到端
+        # 端到端列与页脚一致：优先剔等待版；各级缺失显式留空，不拿解码均值冒充
+        e2e = t.get("tps_e2e_active") or t.get("tps_e2e")
+        wait = fmt_dur((t.get("wait_ms") or 0) / 1000) if (t.get("wait_ms") or 0) >= 5000 else "-"
         dec = t.get("tps")
         print(f"{ts:<20}{fmt_dur((t['run_ms'] or 0) / 1000):>9}{ttft:>9}"
-              f"{(fmt_rate(e2e) if e2e else '-'):>8}{(fmt_rate(dec) if dec else '-'):>9}{fmt_tok(t['out_tokens']):>8}"
+              f"{(fmt_rate(e2e) if e2e else '-'):>8}{wait:>8}{(fmt_rate(dec) if dec else '-'):>9}{fmt_tok(t['out_tokens']):>8}"
               f"{(fmt_tok(t['ctx_tokens']) if t['ctx_tokens'] else '-'):>8}  "
               f"{t['status']}/{'/'.join(t['models']) or '-'}")
     return 0
