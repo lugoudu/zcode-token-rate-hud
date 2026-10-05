@@ -20,7 +20,6 @@ usage_db.py —— ZCode 本地用量库（SQLite）只读折叠层
               有效性判据分子分母同条件：ttft 非空、duration>ttft、输出>0，
               无效样本两侧同剔，避免只进分子抬高均值
   - models  = 本轮用过的模型（去重，斜杠拼接用）
-  - ctx     = 本轮最后一次 main_turn 调用的上下文占用近似值
 
 过滤：model_usage 仅取 status='completed' 且 query_source='main_turn'，
       排除标题生成、压缩等旁路调用与失败重试。
@@ -55,7 +54,7 @@ def fold_turns(path=DB_PATH, limit=800):
     """
     返回按 end_ms 降序的轮列表：
       {turn_id, msg_id, session_id, status, start_ms, end_ms, run_ms,
-       ttft_ms, wait_ms, tps_e2e, tps_e2e_active, tps, out_tokens, models, ctx_tokens}
+       ttft_ms, wait_ms, tps_e2e, tps_e2e_active, tps, out_tokens, models}
     """
     import os
     path = os.path.expanduser(path)
@@ -76,32 +75,31 @@ def fold_turns(path=DB_PATH, limit=800):
             return []
         turn_ids = [r[1] for r in rows]
 
-        # 按轮折叠解码时间、模型列表，并抓每轮最后一次调用的上下文占用
+        # 按轮折叠解码时间与模型列表
         # calls = 该轮已完成的主对话调用数（与实时行 n_calls 同口径）。
         # 按轮次 ID 分块取全调用明细——不做时间窗行数上限，杜绝大库下
-        # 较新调用被静默截断（模型列表/ctx/解码参考值会随之失真）。
-        # 解码有效性分子分母同条件，无效调用两侧同剔。
+        # 较新调用被静默截断（模型列表/解码参考值会随之失真）。
+        # 解码有效性分子分母同条件（含 ttft≥0，负 TTFT 双侧剔除），无效调用两侧同剔。
         # busy = 轮内忙碌时间线（模型调用 + 工具执行区间），用于剥离
         # 工具开始前的等待空档（权限确认等待等）。
         _VALID = """time_to_first_token_ms IS NOT NULL
+                    AND time_to_first_token_ms >= 0
                     AND duration_ms IS NOT NULL
                     AND duration_ms - time_to_first_token_ms > 0
                     AND output_tokens > 0"""
         dec = {}
         calls_by_turn = {}
         models_by_turn = {}
-        ctx_by_turn = {}
         busy = {}  # turn_id -> [(start_ms, end_ms, is_tool), ...]
         for i in range(0, len(turn_ids), 400):
             chunk = turn_ids[i:i + 400]
             qm = ",".join("?" * len(chunk))
-            for turn_id, model_id, started, decode_ms, decode_tok, ctx in conn.execute(
+            for turn_id, model_id, started, decode_ms, decode_tok in conn.execute(
                 f"""
                 SELECT turn_id, model_id, started_at,
                        CASE WHEN {_VALID}
                             THEN duration_ms - time_to_first_token_ms ELSE 0 END,
-                       CASE WHEN {_VALID} THEN output_tokens ELSE 0 END,
-                       computed_total_tokens
+                       CASE WHEN {_VALID} THEN output_tokens ELSE 0 END
                     FROM model_usage
                     WHERE turn_id IN ({qm})
                       AND status = 'completed' AND query_source = 'main_turn'
@@ -116,20 +114,21 @@ def fold_turns(path=DB_PATH, limit=800):
                     lst = models_by_turn.setdefault(turn_id, [])
                     if model_id not in lst:
                         lst.append(model_id)
-                if ctx is not None:
-                    ctx_by_turn[turn_id] = ctx  # 后写覆盖，最终为本轮最后一次
-            # 忙碌时间线：全部已完成调用（不限 main_turn——子代理/旁路调用同样
-            # 占用机器，不能被当等待扣除）+ 工具执行区间。工具的 started_at 是
-            # 实际开跑时刻（用户确认之后），它与上一活动结束之间的空档即等待。
-            # completed_at 为空的（罕见）用 duration_ms 兜底。
+            # 忙碌时间线：全部调用（不限 main_turn/不限状态——子代理、旁路、
+            # 失败/取消/重试调用同样占用机器，滤掉会让这段时间被误当等待扣除）
+            # + 工具执行区间。工具的 started_at 是实际开跑时刻（用户确认之后），
+            # 它与上一活动结束之间的空档即等待。结束时间缺失用 duration_ms 兜底，
+            # 避免退化成不占时长的零长度区间。
             for turn_id, started, call_end in conn.execute(
                 f"""
-                SELECT turn_id, started_at, completed_at FROM model_usage
-                WHERE turn_id IN ({qm}) AND status = 'completed'
+                SELECT turn_id, started_at,
+                       COALESCE(completed_at, started_at + duration_ms, started_at)
+                    FROM model_usage
+                    WHERE turn_id IN ({qm}) AND started_at IS NOT NULL
                 """,
                 chunk,
             ):
-                busy.setdefault(turn_id, []).append((started, call_end or started, False))
+                busy.setdefault(turn_id, []).append((started, call_end, False))
             for turn_id, t_start, t_end in conn.execute(
                 f"""
                 SELECT turn_id, started_at,
@@ -226,7 +225,6 @@ def fold_turns(path=DB_PATH, limit=800):
                 "out_tokens": shown_out,
                 "calls": calls_by_turn.get(tid, 0),
                 "models": models_by_turn.get(tid, []),
-                "ctx_tokens": ctx_by_turn.get(tid),
                 "wf_runs": 0,
                 "wf_actors": 0,
                 "wf_calls": 0,
@@ -263,7 +261,7 @@ def live_turn(path=DB_PATH, max_age_s=1200, session_id=None):
 
     返回 None 或：
       {turn_id, msg_id, session_id, start_ms, now_ms, elapsed_ms, n_calls,
-       ttft_ms, tps, out_tokens, models, ctx_tokens, phase}
+       ttft_ms, tps, out_tokens, models, phase}
 
     phase=1：本轮已有完成的模型调用（完整统计）；
     phase=0：提问已发出、首次调用尚未完成（只有开始时间，行先亮起来）。
@@ -314,7 +312,7 @@ def live_turn(path=DB_PATH, max_age_s=1200, session_id=None):
                     "start_ms": lu[2], "now_ms": now_ms,
                     "elapsed_ms": max(0, now_ms - lu[2]), "n_calls": 0,
                     "ttft_ms": None, "tps": None, "out_tokens": 0,
-                    "models": [], "ctx_tokens": None, "phase": 0,
+                    "models": [], "phase": 0,
                 }
 
         if not head:
@@ -333,7 +331,7 @@ def live_turn(path=DB_PATH, max_age_s=1200, session_id=None):
             return None  # 该轮已结束：交给页脚静态行
         rows = conn.execute(
             """SELECT started_at, duration_ms, time_to_first_token_ms,
-                      output_tokens, model_id, computed_total_tokens
+                      output_tokens, model_id
                FROM model_usage
                WHERE turn_id = ? AND query_source = 'main_turn' AND status = 'completed'
                ORDER BY started_at ASC""",
@@ -347,16 +345,15 @@ def live_turn(path=DB_PATH, max_age_s=1200, session_id=None):
         ttft = rows[0][2] if rows else None
         decode_ms = decode_tok = out_tok = 0
         models = []
-        ctx = None
-        for _started, dur, ttft_i, out, model, total in rows:
-            if ttft_i is not None and dur and (dur - ttft_i) > 0 and out and out > 0:
+        for _started, dur, ttft_i, out, model in rows:
+            # 解码有效性与 fold_turns 同判据（含 ttft≥0），无效样本双侧同剔
+            if ttft_i is not None and ttft_i >= 0 and dur \
+                    and (dur - ttft_i) > 0 and out and out > 0:
                 decode_ms += dur - ttft_i
                 decode_tok += out
             out_tok += out or 0
             if model and model not in models:
                 models.append(model)
-            if total is not None:
-                ctx = total  # 后写覆盖 = 本轮最后一次调用的上下文占用
         tps = (decode_tok * 1000.0 / decode_ms) if decode_ms > 0 else None
         msg_id = None
         try:
@@ -381,7 +378,6 @@ def live_turn(path=DB_PATH, max_age_s=1200, session_id=None):
             "tps": round(tps, 2) if tps else None,
             "out_tokens": out_tok,
             "models": models,
-            "ctx_tokens": ctx,
             "phase": 1,
         }
     finally:

@@ -1,11 +1,12 @@
 /**
- * token-rate-hud 界面页脚注入脚本（`15:40 · 用时 7分40秒 · 首 token 7秒 · 端到端 49 tok/s · GLM-5.3`）
+ * token-rate-hud 界面页脚注入脚本（`15:40 · 用时 7分40秒 · 首 token 7秒 · Decode速度 90 tok/s · 端到端 45 tok/s · GLM-5.3`）
  *
  * 挂载方式：install 时在渲染层 index.html 加一行 <script defer src="file://…/ui/inject.js">，
  *           由 ZCode 渲染层在启动时加载（幂等闸防重复）。
- * 数据源：http://127.0.0.1:__PORT__/turns（本地只读服务，SQLite 用量库，口径=端到端速率：
- *         出 token ÷ 整轮墙钟，含首包等待与工具执行时段；tps_e2e 缺失时退化解码
- *         均值并如实改标「首输出后」，两种口径不共用一个标签）、
+ * 数据源：http://127.0.0.1:__PORT__/turns（本地只读服务，SQLite 用量库）：
+ *         Decode速度 = Σ出token ÷ Σ(时长−首输出等待) 的调用均值（宿主时间代理口径）；
+ *         端到端 = 出 token ÷ 整轮墙钟。等待空档 ≥5s 时端到端换用剔等待分母并必带
+ *         「剔等待Xs」标注（口径切换永远伴随标注，不静默）；
  *         /live?cid=<本窗口 data-turn-id>（服务端解析成会话后，实时行与 workflow 块
  *         都限定在本窗口的会话内——多窗口/后台自动化工作流并存时不串台）。
  * 定位锚：ZCode 每轮对话是 <section data-turn-id="…">（虚拟滚动，滚到哪渲染哪；
@@ -21,7 +22,6 @@
   window.__tokenRateFooterLoaded = true;
 
   const API = "http://127.0.0.1:__PORT__";
-  const SHOW_CTX = __SHOW_CTX__;
   const MARK = "data-token-rate-footer";
   const LIVE_MARK = "data-token-rate-live";
   const WF_MARK = "data-token-rate-wf";
@@ -135,17 +135,18 @@
     line.setAttribute(MARK, "1");
     const parts = [fmtStamp(t.end_ms), `用时 ${fmtDur(t.run_ms)}`];
     if (t.ttft_ms != null && t.ttft_ms >= 0) parts.push(`首 token ${fmtLat(t.ttft_ms)}秒`);
-    // 端到端速率 = 本轮出 token ÷ 整轮墙钟（含首包等待与工具执行时段）。
-    // 剔等待版（tps_e2e_active）从分母扣掉工具开始执行前的等待空档
-    // （权限确认等待等，单段 ≥2s 才计），有数据时优先展示；等待显著时
-    // 紧跟「剔等待Xs」注明，速率条不新增常驻元素。
-    // 两级口径缺失时都不拿解码均值冒充，如实改标「首输出后」
+    // 双速率并列，各自带标签与单位，不出现无量纲数字：
+    //   Decode速度 = Σ出token ÷ Σ(时长−首输出等待) 的调用均值（宿主时间代理口径）
+    //   端到端     = 出 token ÷ 整轮墙钟
+    // 端到端口径门槛：wait_ms ≥ 5s 才启用剔等待分母，且必带「剔等待Xs」标注——
+    // 口径切换永远伴随标注，<5s 一律显示完整墙钟值，不静默换公式。
+    // 缺失侧不显示，任何情况下不跨口径冒充（posNum 显式判定 0/缺失/非有限数）
     const posNum = (v) => typeof v === "number" && isFinite(v) && v > 0;
-    const e2e = posNum(t.tps_e2e_active) ? t.tps_e2e_active : t.tps_e2e;
+    if (posNum(t.tps)) parts.push(`Decode速度 ${fmtTps(t.tps)} tok/s`);
+    const useActive = posNum(t.tps_e2e_active) && t.wait_ms >= 5000;
+    const e2e = useActive ? t.tps_e2e_active : t.tps_e2e;
     if (posNum(e2e)) parts.push(`端到端 ${fmtTps(e2e)} tok/s`);
-    else if (posNum(t.tps)) parts.push(`首输出后 ${fmtTps(t.tps)} tok/s`);
-    if (posNum(e2e) && t.wait_ms >= 5000) parts.push(`剔等待${fmtDur(t.wait_ms)}`);
-    if (SHOW_CTX && t.ctx_tokens) parts.push(`ctx ${fmtTok(t.ctx_tokens)}`);
+    if (useActive) parts.push(`剔等待${fmtDur(t.wait_ms)}`);
     if (t.calls > 1) parts.push(`${t.calls} 次调用`);
     if (t.wf_actors) parts.push(`工作流 ${t.wf_actors} 代理 耗${fmtTok(t.wf_total_tokens || t.wf_out_tokens)} tok`);
     if (Array.isArray(t.models) && t.models.length) parts.push(t.models.join("/"));
@@ -261,8 +262,7 @@
         if (live.calib) liveCalib = live.calib;
         const inst = localInstant(host) || live.instant_tps;
         if (inst) parts.push(`~${fmtTps(inst)} tok/s`);
-        else if (live.tps) parts.push(`${fmtTps(live.tps)} tok/s`);
-        if (SHOW_CTX && live.ctx_tokens) parts.push(`ctx ${fmtTok(live.ctx_tokens)}`);
+        else if (live.tps) parts.push(`已完成均值 ${fmtTps(live.tps)} tok/s`);
         if (live.n_calls > 1) parts.push(`${live.n_calls} 次调用`);
         if (Array.isArray(live.models) && live.models.length) parts.push(live.models.join("/"));
         if (wfSeg) parts.push(wfSeg);

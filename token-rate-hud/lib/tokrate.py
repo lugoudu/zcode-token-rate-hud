@@ -18,7 +18,7 @@ tokrate.py —— ZCode token 速率核心库与 CLI（token-rate-hud 插件）
   tokrate.py report [--session SID | auto] [--turns N] [--calls N]
   tokrate.py serve  [--port 7864] [--session SID | auto]
   tokrate.py footer [--limit N]    打印界面页脚将要展示的轮数据（调试）
-  tokrate.py ui-install [--port N] [--no-ctx]
+  tokrate.py ui-install [--port N]
   tokrate.py ui-status
   tokrate.py ui-uninstall
   tokrate.py line   [--session SID | auto]   # 只打印将要注入的实时行（调试）
@@ -29,8 +29,6 @@ tokrate.py —— ZCode token 速率核心库与 CLI（token-rate-hud 插件）
 
 环境变量配置：
   TOKEN_RATE_INTERVAL  实时行最小注入间隔秒数（默认 8；0 = 每次工具调用后都注入）
-  TOKEN_RATE_MAX_CTX   上下文窗口上限 token 数，用于占用百分比（默认 0 = 不显示百分比；
-                       例如 GLM-5.x 设 128000、Claude 系设 200000）
   TOKEN_RATE_KEEP      状态中保留的最近调用条数（默认 128）
   TOKEN_RATE_IDLE_EXIT 服务空闲多少秒后自动退出（默认 21600；launchd 常驻进程设为
                        999999999 即不退出，由 launchd KeepAlive 保活）
@@ -39,8 +37,8 @@ tokrate.py —— ZCode token 速率核心库与 CLI（token-rate-hud 插件）
 部分通道（Anthropic 风格）则不包含。本工具按 “inputTokens >= cacheReadTokens
 则视为包含” 自适应——这是数值启发式，无法区分“总输入 100 含缓存 80”与
 “非缓存 100 另有缓存 80”两种协议语义，后者会低估输入。会话累计直接使用
-归一后的输入总数（缓存读作为其中细分单列，不再叠加双计）。入速率与 ctx
-估算使用去重后的有效入 token。
+归一后的输入总数（缓存读作为其中细分单列，不再叠加双计）。入速率使用
+去重后的有效入 token。
 """
 
 import fcntl
@@ -64,10 +62,6 @@ UI_DIR = os.path.join(STATE_DIR, "ui")
 HUD_OFF_FLAG = os.path.join(STATE_DIR, "hud-off")  # 存在则不注入任务窗口 HUD 行
 STATE_TTL = 14 * 86400  # 状态文件保留天数
 
-try:
-    MAX_CTX = int(os.environ.get("TOKEN_RATE_MAX_CTX") or 0)
-except ValueError:
-    MAX_CTX = 0  # 0 = 不显示占用百分比（各模型上限不同，避免误导）
 MIN_INTERVAL = float(os.environ.get("TOKEN_RATE_INTERVAL") or 8)
 KEEP_CALLS = int(os.environ.get("TOKEN_RATE_KEEP") or 128)
 ROLLING_WINDOW = 90.0  # 滚动窗口秒数
@@ -330,7 +324,6 @@ def stats_for(calls, totals, session_id):
 
     rates = [c["out"] / c["dur"] for c in turn_calls if c["dur"] > 0.2 and c["out"] > 0]
 
-    ctx_tokens = last.get("in_eff", last["in"] + last["cr"]) + last["out"]
     total_gen = totals["dur"] or 1e-9
 
     return {
@@ -355,27 +348,18 @@ def stats_for(calls, totals, session_id):
             "gen": totals["dur"],
             "avg": totals["out"] / total_gen,
         },
-        "ctx": {"tokens": ctx_tokens, "max": MAX_CTX,
-                "pct": (round(ctx_tokens * 100.0 / MAX_CTX) if MAX_CTX else None)},
     }
 
 
 # ---------------------------------------------------------------- 注入文案
-
-def ctx_part(s):
-    c = s["ctx"]
-    if c["pct"] is not None:
-        return f"ctx {fmt_tok(c['tokens'])}/{fmt_tok(c['max'])}（{c['pct']}%）"
-    return f"ctx {fmt_tok(c['tokens'])}"
-
 
 def line_post(s):
     cur, turn = s["current"], s["turn"]
     return (
         f"{MARK_OK}｜出 {fmt_rate(cur['rate_out'])} tok/s · "
         f"入 {fmt_rate(cur['rate_in'])} tok/s · 缓存读 {fmt_tok(cur['cr'])}｜"
-        f"本轮 {turn['n']} 次 · 出 {fmt_tok(turn['out'])}（均 {fmt_rate(turn['avg'])}）｜"
-        f"{ctx_part(s)}{NO_REPLY_TAG}"
+        f"本轮 {turn['n']} 次 · 出 {fmt_tok(turn['out'])}（均 {fmt_rate(turn['avg'])}）"
+        f"{NO_REPLY_TAG}"
     )
 
 
@@ -386,7 +370,7 @@ def line_stop(s):
         f"出 {fmt_tok(turn['out'])} tok（均 {fmt_rate(turn['avg'])} · 峰 {fmt_rate(turn['peak'])} tok/s）· "
         f"入 {fmt_tok(turn['in'])}｜"
         f"会话累计 {tot['n']} 次 · 出 {fmt_tok(tot['out'])} · 入 {fmt_tok(tot['in'])} · "
-        f"纯生成 {fmt_dur(tot['gen'])}｜{ctx_part(s)}{NO_REPLY_TAG}"
+        f"累计模型调用 {fmt_dur(tot['gen'])}{NO_REPLY_TAG}"
     )
 
 
@@ -503,8 +487,6 @@ def mode_live():
         parts.append(f"首 token {lv['ttft_ms'] / 1000:.1f}s")
     if lv["tps"]:
         parts.append(f"{fmt_rate(lv['tps'])} tok/s")
-    if lv["ctx_tokens"]:
-        parts.append(f"ctx {fmt_tok(lv['ctx_tokens'])}")
     parts.append(f"{lv['n_calls']} 次调用")
     if lv["models"]:
         parts.append("/".join(lv["models"]))
@@ -582,8 +564,6 @@ def mode_report(session_id, n_turns, n_calls):
     t = s["totals"]
     print(f"\n会话累计：出 {fmt_tok(t['out'])} · 入 {fmt_tok(t['in'])}（缓存读 {fmt_tok(t['cr'])}）· "
           f"累计模型调用 {fmt_dur(t['gen'])} · 调用均值出速率 {fmt_rate(t['avg'])} tok/s")
-    print(f"上下文占用：约 {fmt_tok(s['ctx']['tokens'])}" +
-          (f" / {fmt_tok(s['ctx']['max'])}（{s['ctx']['pct']}%）" if s['ctx']['pct'] is not None else ""))
     return 0
 
 
@@ -610,7 +590,6 @@ PAGE = """<!doctype html><html lang="zh"><head><meta charset="utf-8">
  <div class="card"><div class="k">入速率（当前调用）</div><div class="v" id="rin">--</div></div>
  <div class="card"><div class="k">本轮均值 / 峰值</div><div class="v" id="turn">--</div></div>
  <div class="card"><div class="k">会话累计出 / 入</div><div class="v" id="tot">--</div></div>
- <div class="card"><div class="k">上下文占用</div><div class="v" id="ctx">--</div></div>
 </div>
 <canvas id="spark" width="880" height="140"></canvas>
 <div id="wfwrap" style="display:none">
@@ -649,7 +628,6 @@ async function tick(){
   rin.textContent=s.current?(r(s.current.rate_in)+' tok/s'):'--';
   turn.textContent=s.turn?(r(s.turn.avg)+' / '+r(s.turn.peak)+' tok/s'):'--';
   tot.textContent=s.totals?(f(s.totals.out)+' / '+f(s.totals.in)):'--';
-  ctx.textContent=s.ctx?(f(s.ctx.tokens)+(s.ctx.pct!=null?'（'+s.ctx.pct+'%）':'')):'--';
   meta.textContent=s.session+' · '+s.model+' · 本轮 '+s.turn.n+' 次调用 · 更新于 '+new Date().toLocaleTimeString();
   draw(s.calls||[]);
   renderWf(s.workflow||[]);
@@ -853,7 +831,7 @@ def mode_serve(port, session_id):
                         except ValueError:
                             pass
                     turns = turn_cache.get()[:limit]
-                    return self._send(json.dumps({"turns": turns, "schema": 4}, ensure_ascii=False))
+                    return self._send(json.dumps({"turns": turns, "schema": 5}, ensure_ascii=False))
                 if self.path.startswith("/live"):
                     # 进行中轮次的实时数据（每会话 1s 缓存；注入脚本每秒轮询）。
                     # cid = 渲染层上报的本窗口 data-turn-id（user 消息 id），服务端
@@ -982,11 +960,11 @@ def _quarantined():
     return "quarantine" in (r.stdout or "")
 
 
-def _write_stage_js(port, show_ctx):
+def _write_stage_js(port):
     os.makedirs(UI_DIR, exist_ok=True)
     with open(INJECT_SRC, encoding="utf-8") as f:
         src = f.read()
-    src = src.replace("__PORT__", str(port)).replace("__SHOW_CTX__", "true" if show_ctx else "false")
+    src = src.replace("__PORT__", str(port))
     with open(STAGE_JS, "w", encoding="utf-8") as f:
         f.write(src)
 
@@ -1076,7 +1054,7 @@ def _verify_pack(new_asar, workdir):
     return True, f"自检通过（{sum(1 for _, u in expect.values() if not u)} 个内联文件尺寸全部一致）"
 
 
-def ui_install(port, show_ctx, skip_verify=False):
+def ui_install(port, skip_verify=False):
     if not os.path.exists(ASAR):
         print(f"✗ 找不到 {ASAR}，界面页脚模块仅支持 macOS 桌面版 ZCode")
         return 1
@@ -1084,12 +1062,12 @@ def ui_install(port, show_ctx, skip_verify=False):
         print("⚠️  ZCode.app 带 quarantine 隔离标记：改包后 Gatekeeper 可能阻止启动。")
         print("    如遇无法启动，先执行 ui-uninstall 还原；仍要尝试可先去掉隔离标记。")
 
-    _write_stage_js(port, show_ctx)
+    _write_stage_js(port)
     with open(PORT_FILE, "w") as f:
         f.write(str(port))
     if not os.path.exists(ENABLED_FLAG):
         open(ENABLED_FLAG, "w").close()
-    print(f"① 界面脚本已就位：{STAGE_JS}（端口 {port}，ctx 显示 {'开' if show_ctx else '关'}）")
+    print(f"① 界面脚本已就位：{STAGE_JS}（端口 {port}）")
 
     work = os.path.join(STATE_DIR, "asar-work")
     import shutil as _sh
@@ -1403,18 +1381,19 @@ def mode_footer(limit):
     if not turns:
         print("（暂无用量的轮次数据）")
         return 0
-    print(f"{'完成时间':<20}{'用时':>9}{'首token':>9}{'端到端':>8}{'剔等待':>8}{'首输出后':>9}{'出tok':>8}{'ctx':>8}  状态/模型")
+    print(f"{'完成时间':<20}{'用时':>9}{'首token':>9}{'端到端':>8}{'剔等待':>8}{'Decode':>9}{'出tok':>8}  状态/模型")
     for t in turns:
         ts = datetime.fromtimestamp((t["end_ms"] or 0) / 1000).strftime("%m-%d %H:%M:%S")
         ttft = f"{t['ttft_ms'] / 1000:.1f}s" if t["ttft_ms"] else "-"
-        # 端到端列与页脚一致：优先剔等待版；各级缺失显式留空，不拿解码均值冒充
-        e2e = t.get("tps_e2e_active") or t.get("tps_e2e")
-        wait = fmt_dur((t.get("wait_ms") or 0) / 1000) if (t.get("wait_ms") or 0) >= 5000 else "-"
+        # 端到端列与页脚同门槛：wait≥5s 才用剔等待分母且必带剔等待列标注
+        wait_ms = t.get("wait_ms") or 0
+        active = t.get("tps_e2e_active")
+        e2e = active if (active and wait_ms >= 5000) else t.get("tps_e2e")
+        wait = fmt_dur(wait_ms / 1000) if (active and wait_ms >= 5000) else "-"
         dec = t.get("tps")
         print(f"{ts:<20}{fmt_dur((t['run_ms'] or 0) / 1000):>9}{ttft:>9}"
               f"{(fmt_rate(e2e) if e2e else '-'):>8}{wait:>8}{(fmt_rate(dec) if dec else '-'):>9}{fmt_tok(t['out_tokens']):>8}"
-              f"{(fmt_tok(t['ctx_tokens']) if t['ctx_tokens'] else '-'):>8}  "
-              f"{t['status']}/{'/'.join(t['models']) or '-'}")
+              f"  {t['status']}/{'/'.join(t['models']) or '-'}")
     return 0
 
 
@@ -1438,16 +1417,14 @@ def main(argv):
                 limit = int(argv[i + 1])
         return mode_footer(limit)
     if mode == "ui-install":
-        port, show_ctx, skip_verify = DEFAULT_PORT, True, False
+        port, skip_verify = DEFAULT_PORT, False
         args = argv[2:]
         for i, a in enumerate(args):
             if a == "--port" and i + 1 < len(args):
                 port = int(args[i + 1])
-            if a == "--no-ctx":
-                show_ctx = False
             if a == "--skip-verify":
                 skip_verify = True
-        return ui_install(port, show_ctx, skip_verify)
+        return ui_install(port, skip_verify)
     if mode == "ui-uninstall":
         return ui_uninstall()
     if mode == "ui-status":
