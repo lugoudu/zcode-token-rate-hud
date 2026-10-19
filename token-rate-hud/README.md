@@ -91,6 +91,22 @@ ZCode 干活时，每一次“想一下”（模型调用）都会在你电脑�
 
 过滤：`model_usage` 只取 `status='completed'` 且 `query_source='main_turn'`（排除标题生成等旁路调用与失败重试）。GLM 通道的 `inputTokens` 含缓存读、Anthropic 风格不含，按 `inputTokens >= cacheReadTokens` 自适应去重。
 
+<details>
+<summary>附录 A-2：宿主字段实证记录（2026-10-19，样本 = 最近 60~300 条 completed main_turn）</summary>
+
+对 `db.sqlite` 的 `model_usage` 与 `part` 表交叉验证，四条结论：
+
+| 问题 | 结论 | 证据 |
+|---|---|---|
+| `duration_ms` 的端点 | ≡ `completed_at − started_at`（毫秒一致）；`completed_at` 为流+usage 完成时刻，消息组装落盘在其后 P50 约 130ms | `duration_ms` 与两时间戳之差 60/60 条为 0；末次 part 写入 − `completed_at` P50 = −130ms |
+| TTFT 判定规则 | 计时起点 = 首个内容增量（思考流即启动），与 DeepSeek Harness 的 `isTokenDelta`（非空 text/reasoning/tool-call delta）同族 | 思考字符量 0~500 / 500~3000 / 3000~10000 字的 ttft P50 = 9.2s / 9.0s / 8.9s，平坦无相关（r=+0.14）；若量到首正文，深思考调用 ttft 应随思考量增长 |
+| GLM 通道 usage 细分 | `reasoning_tokens` 填报率 0/1343（细分缺失）——分子 = completion 总量（已含思考），与 DSH 对 OpenAI 系口径一致；Kimi-K3 通道有细分 | rollout 中 `reasoningText` 非空但库内 `reasoning_tokens=0` |
+| part 表时间戳语义 | part 行是流初始化时批量创建的占位行（text/reasoning 同刻创建，早于首 token 约 8s）；`time_created` 不能当首内容信号，字符估算依赖内容增量不受影响 | 首 text part − 首 reasoning part = 0；`first_token_at` − 最早 part 创建 P50 = 8.2s |
+
+与 DSH 口径的唯一系统性差异：DSH 的解码期量到「消息落盘」，本插件量到 `completed_at`——分母少约 0.1~0.2s 收尾，短调用下 Decode 略偏高几个百分点，长调用可忽略。rollout jsonl 含完整请求/响应头与 `reasoningText`，是后续逐请求记录（M2 后续）的现成数据源。
+
+</details>
+
 进行中的轮没有 `turn_usage` 行，实时数据从 `model_usage` 聚合当前轮；提问瞬间（`message` 表）即进入“进行中”显示（首步调用完成前显示“首步生成中…”）。
 
 </details>
