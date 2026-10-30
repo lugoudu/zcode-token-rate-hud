@@ -1058,6 +1058,7 @@ def mode_serve(port, session_id):
     # 多窗口并存时回退全局最新轮必然串显；全局查询只留 /live?global=1
     # 显式调试入口（以及 CLI 的 live 命令）。
     cid_cache = {}
+    live_dbg_state = {"last": None}  # /live cid 诊断节流（serve 闭包，方法内可见）
 
     def _scope_of_cid(cid):
         if not cid:
@@ -1160,6 +1161,12 @@ def mode_serve(port, session_id):
                     if scope is not None:
                         with lock:
                             scope_seen[scope] = time.monotonic()
+                    # 诊断（按变化节流）：渲染层上报的 cid → 解析出的会话。宿主升级
+                    # 改动 DOM 的 data-turn-id 语义时，靠它定位实时行不显示的根因
+                    _dbg = f"{cid[:48]}→{scope}"
+                    if _dbg != live_dbg_state["last"]:
+                        live_dbg_state["last"] = _dbg
+                        ui_log(f"[live-cid] {_dbg}")
                     return self._send(json.dumps(_live_response(scope, pending),
                                                  ensure_ascii=False))
                 if self.path.startswith("/healthz"):

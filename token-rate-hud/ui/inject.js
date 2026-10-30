@@ -13,7 +13,9 @@
  *         服务端解析成会话后都限定在本窗口的会话内——多窗口/后台自动化工作流并存时
  *         不串台；cid 未解析时 live_pending=true 且三组数据全空，不回退全局）。
  * 定位锚：ZCode 每轮对话是 <section data-turn-id="…">（虚拟滚动，滚到哪渲染哪；
- *         运行中的轮次另有一个 data-v4-running-live-tail 元素，同选择器）。
+ *         运行中的轮次另有 data-v4-running-live-tail 尾节点——3.17.1 起它是虚拟
+ *         列表 div 且并非全程在 DOM、data-turn-id 轮内会漂移/短暂为空，故 cid 取
+ *         「从后往前第一个非空值」、宿主缺位时按轮 id 反查 section 兜底）。
  * 工作流：实时行末尾追加 ⟪ 工作流 活跃/总数 ⟫ 汇总段（~X=并行瞬时合计，
  *         运行均值/调用均值=均值口径，标签明示），其下另起第二行列出逐个工作流子代理与普通 Agent 工具子代理（名字 + ~瞬时 /
  *         均值 / ✓累计，普通子代理附归属方式标注）；轮次结束后静态行按数据版本回填
@@ -58,15 +60,32 @@
     );
   }
 
+  // 带超时的 fetch：挂起连接必须能返回，否则单飞标志被永久占用、实时轮询整段哑掉
+  function fetchJSON(url, ms) {
+    const ac = new AbortController();
+    const t = setTimeout(() => ac.abort(), ms || 4000);
+    return fetch(url, { signal: ac.signal })
+      .then((r) => r.json())
+      .finally(() => clearTimeout(t));
+  }
+
   // 本窗口的身份：取运行中节点（或最后一个 section）的 data-turn-id（本轮 user 消息 id），
   // 报给 /live?cid= 由服务端解析成会话——实时行与工作流块都限定在本窗口的会话内，
   // 多窗口/后台自动化工作流并存时不会串台。
   function domCid() {
     try {
-      const live = document.querySelector(`section[${LIVE_HOST_ATTR}], [data-turn-id][${LIVE_HOST_ATTR}]`);
-      if (live) return live.getAttribute("data-turn-id") || "";
+      const tail = document.querySelector(`section[${LIVE_HOST_ATTR}], [data-turn-id][${LIVE_HOST_ATTR}]`);
+      const tv = tail && tail.getAttribute("data-turn-id");
+      if (tv) return tv;
+      // 回退：从后往前取第一个非空 data-turn-id。3.17.1 虚拟列表尾部存在属性值为
+      // 空的节点（轮内部分阶段 turnId 未定），盲取最后一个会得到空 cid，服务端只能
+      // 回「待解析」，实时行整轮失效（[live-cid] →None 实测）
       const all = document.querySelectorAll("section[data-turn-id], [data-turn-id]");
-      return all.length ? all[all.length - 1].getAttribute("data-turn-id") || "" : "";
+      for (let i = all.length - 1; i >= 0; i--) {
+        const v = all[i].getAttribute("data-turn-id");
+        if (v) return v;
+      }
+      return "";
     } catch {
       return "";
     }
@@ -74,15 +93,16 @@
 
   // 清掉不在目标宿主里的旧实时节点（宿主切换/回收时防残留）：
   //   WF 行只允许挂在当前目标宿主里；
-  //   LIVE 行只允许挂在带 LIVE_HOST_ATTR 的运行中节点里——宿主属性消失＝轮已结束，
-  //   按轮清掉，交给静态页脚（旧节点被 React 复用成普通 section 时同样命中）。
+  //   LIVE 行同样以「当前目标宿主」为准（3.17.1 运行尾节点并非全程在 DOM，
+  //   宿主可为轮次 section）——轮结束的清理由 tickLive 的无数据分支负责，
+  //   被 React 回收/复用的旧节点不再属于当前宿主，一并命中
   function sweepLines(host) {
     try {
       document.querySelectorAll(`[${WF_MARK}]`).forEach((el) => {
         if (!host || !host.contains(el)) el.remove();
       });
       document.querySelectorAll(`[${LIVE_MARK}]`).forEach((el) => {
-        if (!el.closest(`[${LIVE_HOST_ATTR}]`)) el.remove();
+        if (!host || !host.contains(el)) el.remove();
       });
     } catch {
       /* 静默 */
@@ -92,8 +112,7 @@
   async function fetchTurns() {
     if (Date.now() - fetchedAt < CACHE_MS) return;
     try {
-      const r = await fetch(`${API}/turns?limit=800&_=${Date.now()}`);
-      const j = await r.json();
+      const j = await fetchJSON(`${API}/turns?limit=800&_=${Date.now()}`, 4000);
       if (Array.isArray(j.turns)) {
         turns = j.turns; // 服务端超陈旧上限时 turns 为空列表（宁缺毋假），照实采纳
         fetchedAt = Date.now();
@@ -291,6 +310,7 @@
   }
 
   let liveInFlight = false;
+  let lastLiveOkAt = 0; // 最近一次拿到 live 数据的时刻：cid 短暂抖动的拆行宽限基准
   async function tickLive() {
     if (liveInFlight) return; // 单飞：上一拍请求未返回不重入，防迟到响应互相覆盖
     liveInFlight = true;
@@ -298,38 +318,61 @@
       const cid = domCid();
       let j = null;
       try {
-        const r = await fetch(`${API}/live?cid=${encodeURIComponent(cid)}&_=${Date.now()}`);
-        j = await r.json();
+        j = await fetchJSON(`${API}/live?cid=${encodeURIComponent(cid)}&_=${Date.now()}`, 4000);
       } catch {
-        /* 服务未起：静默 */
+        /* 服务未起/请求超时：静默（超时必返回，单飞标志不会被挂起请求永久占用） */
       }
       // 响应身份核验：请求期间窗口切了轮/换了会话，整包丢弃（迟到响应不覆盖新状态）
       if (j && !cidMatches(domCid(), cid)) return;
       let live = (j && j.live) || null;
-      // live 级核验：live.msg_id 必须属于当前窗口（完整相等或前缀互配），
-      // 否则置空不采纳——服务端快照与窗口状态毫秒级错位时不串显他轮数据
-      if (live && !cidMatches(live.msg_id, cid)) live = null;
+      // 身份核验降为会话级：3.17.1 轮内 DOM 的 turn-id 会随消息推进漂移（user 消息
+      // id → 各 assistant 消息 id），严格比对 live.msg_id≈cid 会整轮误杀。会话圈定
+      // 已由服务端完成（数据按 cid 解析出的 live_scope 查询），这里只拦跨会话串包
+      if (live && j && j.live_scope && live.session_id && live.session_id !== j.live_scope) live = null;
       const wf = (j && Array.isArray(j.workflow)) ? j.workflow : [];
       const subs = (j && Array.isArray(j.subagents)) ? j.subagents : [];
       const subAgg = (j && j.sub_agg_instant) || null;
+      if (live) lastLiveOkAt = Date.now();
       try {
         let host = document.querySelector(`section[${LIVE_HOST_ATTR}], [data-turn-id][${LIVE_HOST_ATTR}]`);
-        // 无运行中节点但本会话的工作流/子代理仍在后台跑：挂到最新一轮的区块下继续显示
-        if (!host && (wf.length || subs.length)) {
-          try {
-            const all = document.querySelectorAll("section[data-turn-id]");
-            if (all.length) host = all[all.length - 1];
-          } catch {
-            /* 静默 */
+        // 3.17.1：运行尾节点是虚拟列表 div，并非全程在 DOM。缺位时先按 live 轮的
+        // id 反查所属 section，再退到最后一个非空 data-turn-id 的 section
+        if (!host) {
+          const secs = Array.from(document.querySelectorAll("section[data-turn-id]"));
+          if (live && secs.length) {
+            for (let i = secs.length - 1; i >= 0; i--) {
+              const v = secs[i].getAttribute("data-turn-id") || "";
+              if (v && (cidMatches(v, live.msg_id) || (live.turn_id && cidMatches(v, live.turn_id)))) {
+                host = secs[i];
+                break;
+              }
+            }
           }
+          if (!host && (live || wf.length || subs.length)) {
+            for (let i = secs.length - 1; i >= 0; i--) {
+              if (secs[i].getAttribute("data-turn-id")) {
+                host = secs[i];
+                break;
+              }
+            }
+          }
+        }
+        if (!host && live) {
+          // DOM 形态再漂移时的定位线索：节点数、尾节点数、当前轮 id
+          diag(`NOHOST nodes=${document.querySelectorAll("[data-turn-id]").length} tail=${document.querySelectorAll(`[${LIVE_HOST_ATTR}]`).length} turn=${(live.turn_id || "").slice(0, 20)}`);
         }
         sweepLines(host);
         let line = host && host.querySelector(`[${LIVE_MARK}]`);
         let wfLine = host && host.querySelector(`[${WF_MARK}]`);
         if (!live && !wf.length && !subs.length) {
-          if (line) line.remove();
-          if (wfLine) wfLine.remove();
-          domSample = { key: "", len: 0, ts: 0 };
+          // cid 短暂抖动（空值/未解析）不立即拆行：5 秒宽限内保留已渲染的实时行，
+          // 下一拍 cid 恢复即继续刷新；真结束由宽限期后的移除兜底
+          const grace = j && j.live_pending && line && Date.now() - lastLiveOkAt < 5000;
+          if (!grace) {
+            if (line) line.remove();
+            if (wfLine) wfLine.remove();
+            domSample = { key: "", len: 0, ts: 0 };
+          }
           return;
         }
         if (!host) return;
