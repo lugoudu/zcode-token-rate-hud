@@ -322,8 +322,13 @@
       } catch {
         /* 服务未起/请求超时：静默（超时必返回，单飞标志不会被挂起请求永久占用） */
       }
-      // 响应身份核验：请求期间窗口切了轮/换了会话，整包丢弃（迟到响应不覆盖新状态）
-      if (j && !cidMatches(domCid(), cid)) return;
+      // 响应身份核验：请求带 cid 且窗口已换轮/换会话 → 丢弃迟到响应（不覆盖新状态）。
+      // 请求时无 cid（DOM 暂无锚点）→ 响应仍要采纳以驱动旧实时行清理——
+      // cidMatches("","") 恒 false，原写法会把空 cid 的成功响应整包丢弃，
+      // 残留行永远走不到清理分支；请求无 cid 而现在有了（锚点刚出现）→ 丢弃，
+      // 下一拍带锚点重来
+      if (j && cid && !cidMatches(domCid(), cid)) return;
+      if (j && !cid && domCid()) return;
       let live = (j && j.live) || null;
       // 身份核验降为会话级：3.17.1 轮内 DOM 的 turn-id 会随消息推进漂移（user 消息
       // id → 各 assistant 消息 id），严格比对 live.msg_id≈cid 会整轮误杀。会话圈定

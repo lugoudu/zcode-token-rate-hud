@@ -509,12 +509,30 @@ def live_turn(path=DB_PATH, max_age_s=1200, session_id=None):
         # 的“提问已发出、首步未完成”窗口，行先亮起来。
         # 必须排除子代理会话（未限定会话时）：工作流/Agent 子代理的会话会持续写入
         # 自己的 user 消息，否则全局最新 user 消息被其劫持，实时行计时错乱（实测发生过）。
+        # fork 幽灵防护（2026-11-05，Codex 联合定位）：fork 复制历史消息（带
+        # metadata.forkOrigin、保留原始时间戳）并在创建时写入 synthetic 提醒
+        # （source=fork/selection_side_chat，时间戳=fork 时刻）——这些消息在本会话
+        # 永远无人消费，会把 phase-0 误判成“待回答的新提问”，令 fork 一打开就出现
+        # 计时幽灵行。在候选阶段即过滤：①排除复制来源；②排除 fork 自建提醒
+        # （不一刀切所有 synthetic——workflow_launch/goal-continuation 等另有语义）；
+        # ③时间兜底用严格 <（正常会话存在首问与会话创建同毫秒的实测案例，<= 会误杀）。
         try:
             lu = conn.execute(
                 """SELECT id, session_id, time_created FROM message
                    WHERE json_extract(data, '$.role') = 'user' {sf}
                      AND session_id NOT LIKE 'sess_dwf%'
                      AND session_id NOT LIKE 'sess_subagent%'
+                     AND json_extract(data, '$.metadata.forkOrigin') IS NULL
+                     AND NOT (
+                         COALESCE(json_extract(data, '$.synthetic'), 0) = 1
+                         AND COALESCE(json_extract(data, '$.source'), '')
+                             IN ('fork', 'selection_side_chat')
+                     )
+                     AND NOT EXISTS (
+                         SELECT 1 FROM session s
+                         WHERE s.id = message.session_id
+                           AND message.time_created < s.time_created
+                     )
                    ORDER BY time_created DESC LIMIT 1""".format(
                     sf="AND session_id = ?" if session_id else ""),
                 ((session_id,) if session_id else ()),
