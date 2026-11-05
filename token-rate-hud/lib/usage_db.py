@@ -644,40 +644,43 @@ def live_turn(path=DB_PATH, max_age_s=1200, session_id=None):
 
 
 def stream_chars(session_id, path=DB_PATH, message_id=None):
-    """该会话指定（缺省最新）assistant 消息全部 text/reasoning 部件的字符合计。
+    """该会话指定（缺省最新）assistant 消息的采样四元组。
 
     以 assistant 消息为采样单位：一条消息常有多个 text/reasoning 部件
     （真实库 15529/25714 条消息部件数 >1，reasoning 增长占大头），只看最后一个
     部件会把 part 切换前新部件已有的增量当基线丢弃。部件行在流式输出过程中
-    被 ZCode 增量更新（time_created 到 time_updated 持续增长），轮询同一消息
-    的合计值变化即可测得逐秒输出速率；两次轮询之间合计值的差即增量。
-    返回 (message_id, chars) 或 None；message_id 缺省取该会话最新 assistant 消息，
-    传入已退出的历史消息 id 也可查询（按消息的增量对齐接口）。
-    与 stream_chars_total 的关系：本函数是单消息口径，是其累计口径的子集，
-    消息切换瞬间 total 会跳增一个已完结消息的字符量。"""
+    被 ZCode 增量更新，轮询同一消息的合计值变化即可测得逐秒输出速率。
+    返回 (message_id, chars, ident) 或 None：
+      chars  = 该消息全部 text/reasoning 部件的字符合计；
+      ident  = (providerId, modelId)，取自消息行 data 本体——正在流式生成的
+               消息没有完成调用行可查，身份只能来自消息自身（真实库
+               assistant 消息 data 均带 providerId/modelId 字段），字段缺失
+               时为 None，由调用方走降级链。
+    message_id 缺省取该会话最新 assistant 消息，传入历史消息 id 也可查询。"""
     import os
 
     path = os.path.expanduser(path)
     conn = _connect(path)
     try:
+        cols = ("id, json_extract(data, '$.providerId'), "
+                "json_extract(data, '$.modelId')")
         if message_id is not None:
             row = conn.execute(
-                """SELECT id FROM message
-                   WHERE id = ? AND session_id = ?
-                     AND json_extract(data, '$.role') = 'assistant'""",
+                f"""SELECT {cols} FROM message
+                    WHERE id = ? AND session_id = ?
+                      AND json_extract(data, '$.role') = 'assistant'""",
                 (message_id, session_id),
             ).fetchone()
-            if not row:
-                return None
         else:
             row = conn.execute(
-                """SELECT id FROM message
-                   WHERE session_id = ? AND json_extract(data, '$.role') = 'assistant'
-                   ORDER BY time_created DESC LIMIT 1""",
+                f"""SELECT {cols} FROM message
+                    WHERE session_id = ?
+                      AND json_extract(data, '$.role') = 'assistant'
+                    ORDER BY time_created DESC LIMIT 1""",
                 (session_id,),
             ).fetchone()
-            if not row:
-                return None
+        if not row:
+            return None
         total = conn.execute(
             """SELECT COALESCE(SUM(length(json_extract(p.data, '$.text'))), 0)
                FROM part p
@@ -685,7 +688,8 @@ def stream_chars(session_id, path=DB_PATH, message_id=None):
                  AND json_extract(p.data, '$.type') IN ('text', 'reasoning')""",
             (row[0],),
         ).fetchone()
-        return (row[0], total[0] or 0)
+        ident = (row[1], row[2]) if (row[1] or row[2]) else None
+        return (row[0], total[0] or 0, ident)
     except sqlite3.Error:
         return None
     finally:
@@ -693,14 +697,19 @@ def stream_chars(session_id, path=DB_PATH, message_id=None):
 
 
 def recent_completed_calls(path=DB_PATH, age_s=300, limit=40):
-    """最近完成的 main_turn 调用（服务层流式校准的配对原料，time.time 秒基准）。
+    """最近完成的调用（服务层流式校准的配对原料，time.time 秒基准）。
 
-    每条带 assistant_message_id（真实库 3457/3457 全填充）：调用输出 token 与
-    该消息 text/reasoning 字符经此 id 一一配对，调用完成即落行——轮结束后
-    最后一次调用同样可查，校准不依赖轮仍 live。completed_at 游标 + 调用 id
-    去重由调用方负责（本函数只按时间窗返回，可重入）。
+    覆盖 main_turn + subagent + workflow_child 三类来源（A3：纯文字步在
+    子代理调用里占比更高，只收 main_turn 会饿死校准样本量）；排除
+    session_title/compact 等杂项。每条带 assistant_message_id（配对键）、
+    provider_id 与 tool_call_count——前者是校准分桶键的一半（同名模型
+    实测来自多个 provider，只按 model 分桶会混通道），后者用于筛掉
+    「文字＋工具参数」混合调用（token 分子含工具参数而字符分子不含，
+    纳入会系统性压低校准比）。
+    completed_at 游标 + 调用 id 去重由调用方负责。
     返回 [{id, session_id, assistant_message_id, output_tokens, model_id,
-           completed_at}]，completed_at 降序；旧版库无列时返回 []。
+           provider_id, tool_call_count, completed_at}]，completed_at 降序；
+    旧版库无列时返回 []。
     """
     import os
 
@@ -709,13 +718,15 @@ def recent_completed_calls(path=DB_PATH, age_s=300, limit=40):
     try:
         return [
             dict(zip(("id", "session_id", "assistant_message_id",
-                      "output_tokens", "model_id", "completed_at"), r))
+                      "output_tokens", "model_id", "provider_id",
+                      "tool_call_count", "completed_at"), r))
             for r in conn.execute(
                 """
                 SELECT id, session_id, assistant_message_id, output_tokens,
-                       model_id, completed_at
+                       model_id, provider_id, tool_call_count, completed_at
                 FROM model_usage
-                WHERE query_source = 'main_turn' AND status = 'completed'
+                WHERE query_source IN ('main_turn', 'subagent', 'workflow_child')
+                  AND status = 'completed'
                   AND assistant_message_id IS NOT NULL AND assistant_message_id != ''
                   AND completed_at >= ?
                 ORDER BY completed_at DESC LIMIT ?
@@ -883,7 +894,25 @@ def workflow_live(path=DB_PATH, recent_s=20, active_s=15, stale_guard_s=600,
             for (aname, sid, rmodel, _ord, n, out_tok, last_ms,
                  dec_ms, dec_tok, total_tok, model_id,
                  sum_dur, first_started, max_ended) in conn.execute(_ACTOR_AGG_SQL, (rid,)):
-                model = model_id or (rmodel.rsplit("/", 1)[-1] if rmodel else None)
+                # 身份取自同一条调用（最新一条，含 running 行——按
+                # COALESCE(completed_at, started_at) 取最新）：MAX(model_id) 与
+                # MAX(provider_id) 是两个独立的字典序最大值，会拼出不存在的
+                # 组合（审查反例：真实 Z/A、A/Z 两行算出 Z/Z）。最新行存在时
+                # provider/model 整体取自该行——包括空值：最新行缺 model 时
+                # 不得拿历史聚合的 model 与新 provider 配对（审查反例：新行
+                # P_NEW/NULL + 旧行 A/Z 拼出 P_NEW|Z）；仅当无任何调用行时
+                # 才回退聚合/manifest 值
+                ident = conn.execute(
+                    """SELECT provider_id, model_id FROM model_usage
+                       WHERE session_id = ? AND query_source = 'workflow_child'
+                       ORDER BY COALESCE(completed_at, started_at) DESC LIMIT 1""",
+                    (sid,),
+                ).fetchone()
+                if ident:
+                    provider_id, model = ident[0], ident[1]
+                else:
+                    provider_id = None
+                    model = model_id or (rmodel.rsplit("/", 1)[-1] if rmodel else None)
                 tps = (dec_tok * 1000.0 / dec_ms) if dec_ms > 0 else None
                 is_running_actor = sid in running_rows
                 active = is_running_actor or (
@@ -892,15 +921,18 @@ def workflow_live(path=DB_PATH, recent_s=20, active_s=15, stale_guard_s=600,
                 # 速率按口径分档（均为平均口径，非并行合计吞吐、非瞬时估算）：
                 #   call_avg_tps  Σout/Σduration 调用均速（含首包等待与执行时段）
                 #   decode_ref_tps  Σout/Σ(duration−ttft) 首输出后参考（= tps 并列）
-                #   task_avg_tps  Σout/actor 任务墙钟（调用跨度；运行中 actor
-                #     终点取当下，避免墙钟落后于持续增长的任务）
+                #   task_avg_tps  Σout/actor 任务墙钟——终点只在确有 running 调用时
+                #     取当下；active 的 15 秒展示宽限不得延长计时分母（A6 反例：
+                #     已完成 actor 分母持续增长再回缩 90.91→50→100）
                 call_avg = (out_tok * 1000.0 / sum_dur) if sum_dur and sum_dur > 0 else None
-                task_end = now_ms if (is_running_actor or active) else (max_ended or 0)
-                task_ms = max(0, (task_end or 0) - (first_started or 0))
+                task_end = now_ms if is_running_actor else (max_ended or 0)
+                task_ms = max(0, task_end - first_started) \
+                    if task_end and first_started else 0
                 task_avg = (out_tok * 1000.0 / task_ms) if task_ms > 0 and out_tok > 0 else None
                 per_actor.append({
                     "name": aname or sid.rsplit("-", 1)[-1],
                     "model": model,
+                    "provider": provider_id,
                     "session_id": sid,
                     "n_calls": n,
                     "out_tokens": out_tok,
@@ -1061,7 +1093,8 @@ def subagent_live(path=DB_PATH, recent_s=60, active_s=15, stale_guard_s=1800,
             rows_c = conn.execute(
                 """SELECT status, started_at, completed_at, duration_ms,
                           time_to_first_token_ms, output_tokens,
-                          computed_total_tokens, input_tokens, agent, model_id
+                          computed_total_tokens, input_tokens, agent, model_id,
+                          provider_id
                    FROM model_usage
                    WHERE session_id = ? AND query_source = 'subagent'
                    ORDER BY started_at ASC""",
@@ -1076,8 +1109,12 @@ def subagent_live(path=DB_PATH, recent_s=60, active_s=15, stale_guard_s=1800,
                 if token else []
             batches = {}  # turn_id -> {calls:[], attributed:最高置信}
             _RANK = {"agent_ref": 0, "inferred": 1, "undetermined": 2}
+            # 身份取自最新一条有身份的调用（同一行取 model+provider，防跨行拼凑）
+            ident_row = next((r for r in reversed(rows_c) if r[9] or r[10]), None)
+            sess_model = ident_row[9] if ident_row else None
+            sess_provider = ident_row[10] if ident_row else None
             for (status, started, completed, dur, ttft_i, out_tok,
-                 comp_tot, in_tok, agent, model_id) in rows_c:
+                 comp_tot, in_tok, agent, model_id, prov_id) in rows_c:
                 turn_key, how = None, "undetermined"
                 if ref_wins:
                     hits = [w for w in ref_wins
@@ -1147,7 +1184,8 @@ def subagent_live(path=DB_PATH, recent_s=60, active_s=15, stale_guard_s=1800,
                     if task_ms > 0 and out_sum > 0 else None
                 out.append({
                     "name": agent or sid_s.rsplit("_", 1)[-1],
-                    "model": model_id,
+                    "model": sess_model,
+                    "provider": sess_provider,
                     "session_id": sid_s,
                     "parent_session_id": pid,
                     "turn_id": turn_key,

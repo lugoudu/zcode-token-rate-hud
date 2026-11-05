@@ -737,9 +737,22 @@ class _Calib:
             if isinstance(v1, (int, float)) and self.LO <= v1 <= self.HI:
                 self.buckets["default"] = {"ema": float(v1), "n": 0}
 
-    def get(self, model):
-        """返回 (换算比, 有效样本数, 桶键)。"""
-        for k in (str(model or "") or "default", "default"):
+    @staticmethod
+    def _keys(provider, model):
+        m = str(model or "") or "default"
+        p = str(provider or "").strip()
+        return (f"{p}|{m}" if p else None), m
+
+    def get(self, provider, model):
+        """返回 (换算比, 有效样本数, 桶键)。
+
+        查找链 provider|model → model → default：同名模型实测来自多个
+        provider（通道输出形态不同），跨通道混桶会互相污染；旧数据只有
+        model 桶，作为降级先验保留。"""
+        k_pm, k_m = self._keys(provider, model)
+        for k in (k_pm, k_m, "default"):
+            if not k:
+                continue
             b = self.buckets.get(k)
             if b and b["n"] > 0:
                 return b["ema"], b["n"], k
@@ -748,9 +761,10 @@ class _Calib:
             return b["ema"], b["n"], "default"
         return self.DEFAULT, 0, "default"
 
-    def update(self, model, ratio):
+    def update(self, provider, model, ratio):
         """一次实测校准：ratio = 消息 text/reasoning 字符 ÷ 调用输出 token。"""
-        k = str(model or "default") or "default"
+        k_pm, k_m = self._keys(provider, model)
+        k = k_pm or k_m
         b = self.buckets.setdefault(k, {"ema": None, "n": 0})
         if b["ema"] is None:  # 新桶以 default 先验（若有）起步
             seed = self.buckets.get("default")
@@ -776,31 +790,46 @@ class _Calib:
 
 
 def _new_stream_state(sid=None):
-    """一个会话的流式采样基线（时间基准统一用单调钟，免疫系统时间跳变）。"""
+    """一个会话的流式采样基线（时间基准统一用单调钟，免疫系统时间跳变）。
+
+    ident = 正在采样的消息身份 (providerId, modelId)，取自消息 data 本体
+    （stream_chars 附带）——首拍为 None（只建基线不产速率），第二拍起用它
+    选校准桶，换模型的首拍天然不会用错桶。"""
     return {"sid": sid, "pid": None, "chars": 0, "ts": 0.0,
-            "tps": None, "last_grow": 0.0}
+            "tps": None, "last_grow": 0.0, "ident": None}
 
 
-def _sample_stream(sid, st, chars_per_token, now):
+def _sample_stream(sid, st, fallback_ratio, now, ratio_fn=None):
     """对会话 sid 最新 assistant 消息采样字符增量，更新瞬时 tok/s。
 
-    采样状态 st 由调用方持有（按 scope 分区，互不串台）；消息切换即重置
-    基线（新消息首见字符作起点）；超 3 秒无字符增长瞬时值作废（工具执行/
-    等待时段）。chars_per_token 为该模型桶的校准比。"""
+    采样状态 st 由调用方持有（按 scope 分区，互不串台）；消息切换或字符
+    回缩（回放/重写）时基线与瞬时值全部重建——新消息不得继承旧消息的
+    速率（A5 反例：切换后零增长仍显示上一消息 50 tok/s）；超 3 秒无字符
+    增长瞬时值作废（工具执行/等待时段）。
+    校准比：优先按本消息身份（st["ident"]，消息 data 自带 provider/model）
+    经 ratio_fn 解析——正在生成的消息没有完成调用行可查，身份只能来自
+    消息本体；身份缺失或 ratio_fn 未命中时用 fallback_ratio（调用方按
+    会话最近身份/模型名给的降级值）。速率只在同消息第二拍起产出，届时
+    身份已就位，换模型首拍不会用错桶（A2）。"""
     try:
         sc = usage_db.stream_chars(sid)
     except Exception:
         sc = None
     if sc:
-        mid, chars = sc
-        if mid == st["pid"]:
-            if chars > st["chars"] and now - st["ts"] >= 0.5:
+        mid, chars, ident = sc
+        if mid == st["pid"] and chars >= st["chars"]:
+            ratio = None
+            if ident and ratio_fn:
+                ratio = ratio_fn(ident)
+            ratio = ratio or fallback_ratio
+            if chars > st["chars"] and now - st["ts"] >= 0.5 and ratio > 0:
                 cps = (chars - st["chars"]) / (now - st["ts"])
-                st["tps"] = round(cps / chars_per_token, 1)
+                st["tps"] = round(cps / ratio, 1)
                 st["last_grow"] = now
-            st["chars"], st["ts"] = chars, now
-        else:  # 消息切换：基线重置，瞬时值留待 3 秒过期或新消息出增量
+            st["chars"], st["ts"], st["ident"] = chars, now, ident
+        else:  # 消息切换/字符回缩：基线与瞬时值一并清零重建
             st["sid"], st["pid"], st["chars"], st["ts"] = sid, mid, chars, now
+            st["tps"], st["last_grow"], st["ident"] = None, 0.0, ident
     if now - st["last_grow"] > 3.0:
         st["tps"] = None
     return st["tps"]
@@ -845,12 +874,19 @@ def mode_serve(port, session_id):
 
     # ---- 流式校准：按 assistant_message_id 配对「完成调用输出 token ↔ 该
     # 消息最终 text/reasoning 字符」（真实库 3457/3457 全带该 id）。调用完成
-    # 即落行，轮结束后最后一条调用同样可查——校准不再依赖轮仍 live。工具调用
-    # 参数不在 text/reasoning 部件，天然不计入字符分子；纯工具步（字符 0）
-    # 直接跳过。按调用 id 去重保证幂等。同样仅周期任务线程读写。
+    # 即落行，轮结束后最后一条调用同样可查——校准不再依赖轮仍 live。只收
+    # 纯文字调用（tool_call_count=0，A3）：混合工具步的 token 分子含工具参数
+    # 而字符分子不含，纳入会压低校准比。按调用 id 去重保证幂等。
+    # 仅周期任务线程读写。
     calib = _Calib(os.path.join(UI_DIR, "calib.json"))
     calib_seen = {}     # 调用 id -> 处理完的单调时刻（去重，10 分钟窗口）
-    calib_pending = {}  # 调用 id -> {"chars","tries","t0"}（两遍采样确认消息定型）
+    calib_pending = {}  # 调用 id -> {"chars","tries","t0",...}（两遍采样确认消息定型）
+    # 消息/会话 → (provider, model) 身份映射：由 _calibrate 每周期从最近完成
+    # 调用刷新，_refresh_live 用「正在采样的消息」的身份查校准桶（A2：不再用
+    # 「最后一个完成调用的模型」冒充当前流的消息身份；轮内换模型不再用错桶）。
+    # 仅周期任务线程读写。
+    msg_ident = {}
+    sess_ident = {}
 
     def _refresh_live(scope):
         """刷新一个 scope 的实时轮数据（周期任务线程内调用）。
@@ -868,9 +904,19 @@ def mode_serve(port, session_id):
             if st is None or st["sid"] != lv["session_id"]:
                 st = _new_stream_state(lv["session_id"])  # 会话切换：基线清零重测
                 streams[scope] = st
-            model = (lv.get("models") or [None])[-1]
-            v, n, bkey = calib.get(model)
-            lv["instant_tps"] = _sample_stream(lv["session_id"], st, v, time.monotonic())
+            # 校准身份链：正在采样的消息本体身份（stream_chars 附带）→
+            # 本会话最近完成调用（sess_ident，_calibrate 刷新）→ live 模型名
+            ident = st.get("ident") or sess_ident.get(lv["session_id"])
+            prov, mdl = ident if ident else (None, None)
+            if not mdl:
+                mdl = (lv.get("models") or [None])[-1]
+
+            def _ratio_for(ident_m):
+                return calib.get(ident_m[0], ident_m[1])[0]
+
+            v, n, bkey = calib.get(prov, mdl)
+            lv["instant_tps"] = _sample_stream(lv["session_id"], st, v,
+                                               time.monotonic(), _ratio_for)
             lv["calib"] = v
             lv["calib_n"] = n        # 该换算比的有效校准样本数
             lv["calib_bucket"] = bkey
@@ -894,42 +940,64 @@ def mode_serve(port, session_id):
         except Exception as exc:
             runs, subs, err = [], [], f"{type(exc).__name__}: {exc}"
         if err is None:
+            # 瞬时采样按「子会话唯一流」去重（B1 反例：同一子代理跨轮形成两条
+            # 活跃批次，共享采样态被逐批采样并把同一增量累加两次 50+50=100）：
+            # 每周期每个子会话只采样一次；同流多批次展示同一瞬时值（同一
+            # 输出流），并行合计按唯一会话求和——不是双倍吞吐
+            sampled_inst = {}  # 子会话 id -> 本周期瞬时值（workflow 与 subagent 共用）
+            # 校准比按「消息本体身份」解析（stream_chars 附带 provider/model），
+            # 载荷的 provider/model 仅作 fallback 与展示
+            def _ratio_for(ident_m):
+                return calib.get(ident_m[0], ident_m[1])[0]
+
             # 工作流 actor 瞬时采样：状态按本 scope 分区，清理只清本 scope
             # 跟踪器——两个窗口交替请求不再互清对方基线
             st_map = wf_streams.setdefault(scope, {})
             seen = set()
             for run in runs:
                 agg = 0.0
+                agg_sids = set()
                 for a in run.get("per_actor", []):
                     sid_a = a.get("session_id")
                     if not sid_a:
                         continue
                     seen.add(sid_a)
                     st = st_map.setdefault(sid_a, _new_stream_state(sid_a))
-                    v = calib.get(a.get("model"))[0]
-                    a["instant_tps"] = _sample_stream(sid_a, st, v, now)
-                    if a.get("active") and a["instant_tps"]:
+                    if sid_a not in sampled_inst:
+                        sampled_inst[sid_a] = _sample_stream(
+                            sid_a, st,
+                            calib.get(a.get("provider"), a.get("model"))[0],
+                            now, _ratio_for)
+                    a["instant_tps"] = sampled_inst[sid_a]
+                    if a.get("active") and a["instant_tps"] and sid_a not in agg_sids:
+                        agg_sids.add(sid_a)
                         agg += a["instant_tps"]
-                # agg_instant = 并行瞬时合计（各活跃子代理瞬时值相加），与
-                # tps/decode_ref_tps（调用均值）是两种口径，渲染层勿混用
+                # agg_instant = 并行瞬时合计（各活跃子代理瞬时值相加，按唯一流
+                # 去重），与 tps/decode_ref_tps（调用均值）是两种口径，勿混用
                 run["agg_instant"] = round(agg, 1) if agg else None
             for sid_a in [k for k in st_map if k not in seen]:
                 st_map.pop(sid_a, None)  # 运行结束/宽限过期：只清本 scope
-            # 普通子代理（Agent 工具）瞬时采样：批次行同构注入 instant_tps
+            # 普通子代理（Agent 工具）瞬时采样：批次行同构注入 instant_tps，
+            # 同样按唯一子会话采样与合计（跨轮续跑的双批次只计一次）
             sb_map = sub_streams.setdefault(scope, {})
             sub_seen = set()
             sub_agg = 0.0
+            sub_agg_sids = set()
             for b in subs:
                 sid_b = b.get("session_id")
                 if not sid_b:
                     continue
                 sub_seen.add(sid_b)
                 st = sb_map.setdefault(sid_b, _new_stream_state(sid_b))
-                inst = None
-                if b.get("active"):
-                    inst = _sample_stream(sid_b, st, calib.get(b.get("model"))[0], now)
+                if sid_b not in sampled_inst:
+                    sampled_inst[sid_b] = _sample_stream(
+                        sid_b, st,
+                        calib.get(b.get("provider"), b.get("model"))[0],
+                        now, _ratio_for)
+                inst = sampled_inst[sid_b] if b.get("active") else None
                 b["instant_tps"] = inst
-                if inst:
+                if inst and sid_b not in sub_agg_sids:
+                    sub_agg_sids.add(sid_b)
                     sub_agg += inst
             for sid_b in [k for k in sb_map if k not in sub_seen]:
                 sb_map.pop(sid_b, None)
@@ -956,10 +1024,10 @@ def mode_serve(port, session_id):
         失败不让该调用永远失去校准资格。"""
         now = time.monotonic()
 
-        def _settle(cid_, chars, out, model_id):
+        def _settle(cid_, chars, out, provider, model_id):
             """定型收账：带内比值落校准，之后无论结果都记 seen 并清 pending。"""
             if chars and _Calib.LO <= chars / out <= _Calib.HI:
-                calib.update(model_id, chars / out)
+                calib.update(provider, model_id, chars / out)
                 calib.save()
             calib_seen[cid_] = now
             calib_pending.pop(cid_, None)
@@ -968,15 +1036,30 @@ def mode_serve(port, session_id):
             calls = usage_db.recent_completed_calls(age_s=300, limit=40)
         except Exception:
             calls = []  # 查询失败（连接失败等）不中断清账：到期 pending 仍要独立结算
-        round_ids = set()
+        # 身份映射刷新：仅作降级 fallback（消息本体身份缺失时用本会话最近
+        # 完成调用的身份）。calls 按完成时间降序，首次命中即最新——后到
+        # 的更旧记录不得覆盖（审查反例：倒序遍历反复赋值留下最旧一条）
+        msg_ident.clear()
+        sess_ident.clear()
+        for c in calls:
+            mid_c = c.get("assistant_message_id")
+            if mid_c and mid_c not in msg_ident:
+                msg_ident[mid_c] = (c.get("provider_id"), c.get("model_id"))
+            if c["session_id"] not in sess_ident:
+                sess_ident[c["session_id"]] = (c.get("provider_id"), c.get("model_id"))
         for c in calls:
             cid_ = c["id"]
-            round_ids.add(cid_)
             if cid_ in calib_seen:
                 continue
             out = c["output_tokens"] or 0
             mid = c["assistant_message_id"]
             if not mid or out < 50:  # 微小输出不具校准价值
+                calib_seen[cid_] = now
+                continue
+            if (c.get("tool_call_count") or 0) > 0:
+                # 混合工具步（A3）：输出 token 含工具调用参数，而字符分子只含
+                # text/reasoning——两者口径错配，纳入会系统性压低校准比并抬高
+                # 后续瞬时估算。只收纯文字调用（tool_call_count=0）
                 calib_seen[cid_] = now
                 continue
             p = calib_pending.get(cid_)
@@ -986,8 +1069,10 @@ def mode_serve(port, session_id):
                 except Exception:
                     sc = None  # 瞬时 SQLite 错误与「消息未落库」同走 pending 重试，
                     #           不记 seen——首查失败不该让该调用永远失去校准资格
-                calib_pending[cid_] = {"chars": sc[1] if sc else None, "tries": 1,
-                                       "t0": now, "out": out, "model_id": c["model_id"],
+                calib_pending[cid_] = {"chars": sc[1] if sc else None,
+                                       "tries": 1, "t0": now, "out": out,
+                                       "provider": c.get("provider_id"),
+                                       "model_id": c["model_id"],
                                        "sid": c["session_id"], "mid": mid}
                 continue
             if now - p["t0"] >= 120:
@@ -1002,27 +1087,34 @@ def mode_serve(port, session_id):
             if p["chars"] is None:  # 首次见到字符：记基线，下一拍再判定型
                 p["chars"], p["tries"] = chars, p["tries"] + 1
                 continue
-            settled = p["chars"] == chars or p["tries"] >= 10
+            # 定型判定（审查修正）：仅「两拍字符相同且非零」才算定型——
+            # 零字符（部件未落库或纯工具步）不作数：部件存在不等于文字已
+            # 最终落库（审查反例：两拍空 text 部件后才出现文字）。零字符
+            # 样本一律等 120 秒到期清账裁决；次数上限不再代表定型（超长
+            # 消息中途强收会把半截字符当终值），未定型样本到期未稳即丢弃
+            settled = chars == p["chars"] and chars > 0
             if not settled:
                 p["chars"], p["tries"] = chars, p["tries"] + 1
-                continue  # 消息仍在写：继续等。chars 0→>0 亦属此列——调用
-                # completed_at 落库可能早于 assistant 消息 part 写入字符，
-                # 首拍 0 不能定性为纯工具步，观察两遍再下结论
-            _settle(cid_, chars, p["out"], p["model_id"])
-        # 统一清账：到期 pending 无论本轮是否还出现在查询结果里都做最后兜底——
-        # 高调用量挤出 40 条窗口或超出 300s 年龄后主循环不再见到该调用，
-        # 不独立清账就会永久滞留 pending（终审实测 127s 仍卡住）
+                continue
+            _settle(cid_, chars, p["out"], p.get("provider"), p["model_id"])
+        # 统一清账：到期 pending 一律「当下重查」并只在「重查值与最后观察
+        # 值一致且非零」（到期限时已稳定）时收账；仍在增长（fresh ≠ last）
+        # 或始终无字符的样本按质量优先原则丢弃——校准宁可少样本，不收
+        # 半截值（A4：旧实现用观察期半截字符结账，会把校准比压低）
         for cid_, p in list(calib_pending.items()):
             if now - p["t0"] < 120:
                 continue
-            chars = p["chars"]
-            if chars is None and p.get("mid"):
+            chars = None
+            if p.get("mid"):
                 try:
                     sc = usage_db.stream_chars(p["sid"], message_id=p["mid"])
-                    chars = sc[1] if sc else None
+                    if sc:
+                        chars = sc[1]
                 except Exception:
                     chars = None  # 最后兜底也查不到：放弃，记 seen 防永久滞留
-            _settle(cid_, chars, p["out"], p["model_id"])
+            stable = chars is not None and chars > 0 and p["chars"] == chars
+            _settle(cid_, chars if stable else None,
+                    p["out"], p.get("provider"), p["model_id"])
         for k in [k for k, t in calib_seen.items() if now - t > 600]:
             calib_seen.pop(k, None)
 
@@ -1714,11 +1806,12 @@ def mode_footer(limit):
     for t in turns:
         ts = datetime.fromtimestamp((t["end_ms"] or 0) / 1000).strftime("%m-%d %H:%M:%S")
         ttft = f"{t['ttft_ms'] / 1000:.1f}s" if t["ttft_ms"] else "-"
-        # 端到端列与页脚同门槛：wait≥5s 才用剔等待分母且必带剔等待列标注
+        # 端到端固定完整墙钟口径（A8：与页脚一致，删除旧的 ≥5s 换分母切换）；
+        # 剔等待值只要产出就另列（时长 + 对应 tok/s 一体展示）
         wait_ms = t.get("wait_ms") or 0
         active = t.get("tps_e2e_active")
-        e2e = active if (active and wait_ms >= 5000) else t.get("tps_e2e")
-        wait = fmt_dur(wait_ms / 1000) if (active and wait_ms >= 5000) else "-"
+        e2e = t.get("tps_e2e")
+        wait = f"{fmt_rate(active)}·{fmt_dur(wait_ms / 1000)}" if active else "-"
         dec = t.get("tps")
         print(f"{ts:<20}{fmt_dur((t['run_ms'] or 0) / 1000):>9}{ttft:>9}"
               f"{(fmt_rate(e2e) if e2e else '-'):>14}{wait:>8}{(fmt_rate(dec) if dec else '-'):>9}{fmt_tok(t['out_tokens']):>8}"

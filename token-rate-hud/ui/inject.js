@@ -1,11 +1,13 @@
 /**
- * token-rate-hud 界面页脚注入脚本（`15:40 · 用时 7分40秒 · 首 token 7秒 · Decode速度 90 tok/s · 有效样本 12/14 · 端到端 45 tok/s · 剔等待2分10秒 52 tok/s · GLM-5.3`）
+ * token-rate-hud 界面页脚注入脚本（`15:40 · 用时 7分40秒 · 首 token 7秒 · Decode速度 90 tok/s · 端到端 45 tok/s · 剔等待2分10秒 52 tok/s · GLM-5.3`）
  *
  * 挂载方式：install 时在渲染层 index.html 加一行 <script defer src="file://…/ui/inject.js">，
  *           由 ZCode 渲染层在启动时加载（幂等闸防重复）。
  * 数据源：http://127.0.0.1:__PORT__/turns（schema 6，本地只读服务，SQLite 用量库）：
- *         Decode速度 = Σ出token ÷ Σ(时长−首输出等待) 的调用均值（宿主时间代理口径），
- *         样本不齐时并排显示「有效样本 N/M」（无效调用两侧同剔，原因悬停可见）；
+ *         Decode速度 = Σ出token ÷ Σ(时长−首输出等待) 的调用均值（宿主时间代理口径）；
+ *         有效样本覆盖率（decode_valid_calls/decode_total_calls、decode_drop_*）
+ *         不在页脚展示——日常看速率用不上，统计时走 /turns API 与报告层
+ *         （2026-11-05 用户决策，载荷字段保留）；
  *         端到端固定显示整轮墙钟值（出 token ÷ 整轮墙钟）；服务端产出的剔等待值
  *         （tps_e2e_active，仅「有主调用完成且空档无推断成分」的轮产出）另列一段，
  *         标签与数字一体、不被省略号截断；
@@ -207,20 +209,10 @@
     //   端到端     = 出 token ÷ 整轮墙钟（固定完整墙钟值，绝不静默换分母）
     // 剔空档值（tps_e2e_active）另列：标签「剔等待Xs」与数字一体成段，不被截断。
     // 缺失侧不显示，任何情况下不跨口径冒充（posNum 显式判定 0/缺失/非有限数）
-    const vc = t.decode_valid_calls || 0;
-    const tc = t.decode_total_calls || 0;
     if (posNum(t.tps)) {
       segs.push(`Decode速度 ${fmtTps(t.tps)} tok/s`);
-      // 有效样本覆盖：decode 分子分母同条件剔除无效调用，样本不齐时并排披露
-      if (tc > 0 && vc < tc) segs.push(`有效样本 ${vc}/${tc}`);
       decTitle.push(`Decode速度＝首输出后调用均值（Σ出token÷Σ(时长−TTFT)，宿主时间代理口径）`);
-      const drops = [];
-      if (t.decode_drop_ttft_missing) drops.push(`缺TTFT ${t.decode_drop_ttft_missing}`);
-      if (t.decode_drop_ttft_negative) drops.push(`负TTFT ${t.decode_drop_ttft_negative}`);
-      if (t.decode_drop_zero_duration) drops.push(`零时长 ${t.decode_drop_zero_duration}`);
-      if (t.decode_drop_zero_output) drops.push(`零输出 ${t.decode_drop_zero_output}`);
-      if (t.decode_drop_not_completed) drops.push(`未完成 ${t.decode_drop_not_completed}`);
-      decTitle.push(`有效样本 ${vc}/${tc}` + (drops.length ? `（剔除：${drops.join("、")}；原因可重叠，一次调用可同时命中多个）` : ""));
+      // 有效样本覆盖率（vc/tc、decode_drop_*）不在页脚展示：统计需求走 /turns 与报告
     }
     if (posNum(t.tps_e2e)) segs.push(`端到端 ${fmtTps(t.tps_e2e)} tok/s`);
     if (posNum(t.tps_e2e_active)) {
