@@ -221,8 +221,25 @@
       segs.push(`剔等待${t.wait_ms > 0 ? fmtDur(t.wait_ms) : ""} ${fmtTps(t.tps_e2e_active)} tok/s`);
       decTitle.push(`剔等待值＝整轮输出÷（墙钟−执行前空档合计），仅空档无推断成分的轮产出`);
     }
+    // 本轮总消耗（主轮自身，不含孩子——工作流/子代理段另计，实证父轮账本不含孩子）：
+    // 轮账本 computed_total 直通，账本缺失才回退调用明细；
+    // 悬停给完整整数（fmtTok 会舍入）＋来源＋差额中性披露（Codex 审查要求）
+    if (typeof t.turn_total_tokens === "number" && t.turn_total_tokens > 0) {
+      segs.push(`耗 ${fmtTok(t.turn_total_tokens)} tok`);
+      const srcTxt = t.turn_total_source === "ledger" ? "宿主轮账本" : "调用明细回退（账本缺失）";
+      let h = `本轮总消耗 ${t.turn_total_tokens} tok（${srcTxt}；入+出，缓存读计入输入；不含子代理/工作流，各自段另计）`;
+      if (typeof t.total_ledger_diff === "number" && t.total_ledger_diff !== 0) {
+        h += `；账本较可见调用明细${t.total_ledger_diff > 0 ? "多" : "少"} ${Math.abs(t.total_ledger_diff)} tok（来源未完全核实）`;
+      }
+      decTitle.push(h);
+    }
     if (t.calls > 1) segs.push(`${t.calls} 次调用`);
-    if (t.wf_actors) segs.push(`工作流 ${t.wf_actors} 代理 耗${fmtTok(t.wf_total_tokens || t.wf_out_tokens)} tok`);
+    if (t.wf_actors) segs.push(`工作流 ${t.wf_actors} 代理 另计${fmtTok(t.wf_total_tokens || t.wf_out_tokens)} tok`);
+    // 子代理段：正消耗独立触发展示——sub_calls 只计 completed，而 total 含
+    // 失败/取消调用；仅失败/取消时 sub_calls=0 但消耗>0，不得整段隐藏（审查反例）
+    if ((t.sub_calls || 0) > 0 || (t.sub_total_tokens || 0) > 0) {
+      segs.push(`子代理${t.sub_calls ? ` ${t.sub_calls} 次` : ""} 另计${fmtTok(t.sub_total_tokens || 0)} tok`);
+    }
     if (Array.isArray(t.models) && t.models.length) segs.push(t.models.join("/"));
     if (t.status && t.status !== "completed") segs.push("（已取消）");
 
@@ -411,20 +428,25 @@
           if (!live.n_calls) parts.push("首步生成中…");
           if (live.ttft_ms != null && live.ttft_ms >= 0) parts.push(`首 token ${fmtLat(live.ttft_ms)}秒`);
           if (live.calib) liveCalib = live.calib;
+          // 已记录消耗（主轮自身，全终态已落库调用；流式中的调用完成前不计入，
+          // 轮结束由静态行按轮账本口径定稿——悬停说明避免误读为最终值）
+          if (live.total_tokens > 0) parts.push(`已记录 ${fmtTok(live.total_tokens)} tok`);
+          const hoverParts = [];
+          if (live.total_tokens > 0) {
+            hoverParts.push(`已记录 ${live.total_tokens} tok＝已落库调用合计（含取消/失败行；正在生成的调用完成前不计入；轮结束按轮账本口径更新）`);
+          }
           // 瞬时速率：后端按消息统计的增量优先，本地 DOM 测算只作回退
           const inst = (live.instant_tps && live.instant_tps > 0) ? live.instant_tps : domInstant(host, live);
           if (inst) {
             parts.push(`~${fmtTps(inst)} tok/s`);
             if (live.calib) {
-              line.title = `流式估算：按消息字符增速÷校准比换算（校准比 ${live.calib}` +
-                `，有效样本 ${live.calib_n != null ? live.calib_n : 0}，随调用完成自动校准）`;
+              hoverParts.push(`流式估算：按消息字符增速÷校准比换算（校准比 ${live.calib}` +
+                `，有效样本 ${live.calib_n != null ? live.calib_n : 0}，随调用完成自动校准）`);
             }
-          } else {
-            if (live.tps) parts.push(`已完成均值 ${fmtTps(live.tps)} tok/s`);
-            // 瞬时值作废（超 3 秒无字符增长）或尚无完成调用：清掉流式估算的
-            // 悬停说明，title 必须与当前显示口径一致，不残留旧说明
-            line.title = "";
+          } else if (live.tps) {
+            parts.push(`已完成均值 ${fmtTps(live.tps)} tok/s`);
           }
+          line.title = hoverParts.join("；");
           if (live.n_calls > 1) parts.push(`${live.n_calls} 次调用`);
           if (Array.isArray(live.models) && live.models.length) parts.push(live.models.join("/"));
           if (wfSeg) parts.push(wfSeg);

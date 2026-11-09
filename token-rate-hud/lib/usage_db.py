@@ -109,7 +109,8 @@ def fold_turns(path=DB_PATH, limit=800):
         rows = conn.execute(
             """
             SELECT session_id, turn_id, user_message_id, status,
-                   started_at, completed_at, time_to_first_token_ms, output_tokens
+                   started_at, completed_at, time_to_first_token_ms, output_tokens,
+                   computed_total_tokens
             FROM turn_usage
             WHERE user_message_id IS NOT NULL AND user_message_id != ''
               AND session_id NOT LIKE 'sess_dwf%'
@@ -132,6 +133,9 @@ def fold_turns(path=DB_PATH, limit=800):
         dec = {}
         calls_by_turn = {}
         main_out_by_turn = {}   # 主调用账本：完成 main_turn 调用 Σoutput（不限有效性）
+        calls_tot_by_turn = {}  # 主调用消耗账本：全部终态（非 running）调用
+                                # Σ(COALESCE(computed_total, 逐项COALESCE(input+output)))
+                                # ——供「耗 X tok」的账本回退与差额披露
         models_by_turn = {}
         cov = {}   # (session_id, turn_id) -> decode 覆盖率/剔除原因计数
         busy = {}  # (session_id, turn_id) -> [(start_ms, end_ms, is_tool), ...]
@@ -140,7 +144,7 @@ def fold_turns(path=DB_PATH, limit=800):
         # 越出轮终点的尾巴不污染空档判定（真实库实测 43 条 session_title 越界）；
         # 轮未闭合时窗口终点取当下，后续按 unknown 处理不产出高置信度剔等待值
         window = {}
-        for r_sid, r_tid, _mid, _r_status, r_started, r_completed, _tf, _out in rows:
+        for r_sid, r_tid, _mid, _r_status, r_started, r_completed, _tf, _out, _r_tot in rows:
             window[(r_sid, r_tid)] = (r_started or 0, r_completed or now_fold)
 
         # 以轮为基准分块（每块 ≤400 轮）：会话与轮是两个独立去重列表，若按
@@ -154,10 +158,12 @@ def fold_turns(path=DB_PATH, limit=800):
             s_chunk = sorted({r[0] for r in rows if r[1] in t_set})
             qm_t = ",".join("?" * len(t_chunk))
             qm_s = ",".join("?" * len(s_chunk))
-            for sid_c, tid_c, model_id, status, started, dur, ttft_i, out in conn.execute(
+            for sid_c, tid_c, model_id, status, started, dur, ttft_i, out, comp_tot in conn.execute(
                 f"""
                 SELECT session_id, turn_id, model_id, status, started_at, duration_ms,
-                       time_to_first_token_ms, output_tokens
+                       time_to_first_token_ms, output_tokens,
+                       COALESCE(computed_total_tokens,
+                                COALESCE(input_tokens, 0) + COALESCE(output_tokens, 0))
                 FROM model_usage
                 WHERE turn_id IN ({qm_t})
                   AND query_source = 'main_turn'
@@ -169,6 +175,11 @@ def fold_turns(path=DB_PATH, limit=800):
                 if (sid_c, tid_c) not in turn_keys:
                     continue
                 key = (sid_c, tid_c)
+                # 消耗聚合（与速率聚合口径分离）：全部终态（非 running）调用的
+                # 已记录用量都计入——取消/失败行的 token 同样是真实消耗；
+                # running 行不计（未定稿，统一规则；GLM 通道本就完成才落行）
+                if status != "running":
+                    calls_tot_by_turn[key] = calls_tot_by_turn.get(key, 0) + (comp_tot or 0)
                 c = cov.setdefault(key, {"total": 0, "valid": 0,
                                          "valid_out": 0, "total_out": 0,
                                          "ttft_missing": 0, "ttft_negative": 0,
@@ -354,7 +365,7 @@ def fold_turns(path=DB_PATH, limit=800):
         conn.close()
 
     out = []
-    for sid, tid, msg_id, status, started, completed, ttft, out_tok in rows:
+    for sid, tid, msg_id, status, started, completed, ttft, out_tok, led_tot in rows:
         key = (sid, tid)
         completed_eff = completed or started
         decode_ms, decode_tok = dec.get(key, (0, 0))
@@ -402,6 +413,22 @@ def fold_turns(path=DB_PATH, limit=800):
                 "turn_output_tokens": out_tok,
                 "main_call_output_tokens": main_out,
                 "output_ledger_diff": (out_tok - main_out) if out_tok is not None else None,
+                # 本轮总消耗（主轮自身，不含子代理/工作流——孩子各自段另计；
+                # 实证：父轮账本只含主调用，不含孩子，Codex 反例已复核）：
+                #   turn_total_tokens  展示值：轮账本 computed_total_tokens 直通，
+                #                      账本缺失（NULL，防御）才回退主调用消耗账本；
+                #                      0 是合法确认值（上层按 >0 决定显示）
+                #   turn_total_source  "ledger" | "call_fallback" | None（无任何终态调用行）
+                #   total_ledger_diff  账本 − 可见调用明细 Σ（仅账本存在时；
+                #                      实证样本方向为正，来源未完全核实，不作归因）
+                "turn_total_tokens": led_tot if led_tot is not None
+                                     else calls_tot_by_turn.get(key),
+                "turn_total_source": "ledger" if led_tot is not None
+                                     else ("call_fallback" if key in calls_tot_by_turn else None),
+                "turn_calls_total_tokens": calls_tot_by_turn.get(key),
+                "total_ledger_diff": (led_tot - calls_tot_by_turn[key])
+                                     if led_tot is not None and key in calls_tot_by_turn
+                                     else None,
                 "decode_valid_calls": cv["valid"] if cv else 0,
                 "decode_total_calls": cv["total"] if cv else 0,
                 "decode_valid_out_tokens": cv["valid_out"] if cv else 0,
@@ -550,7 +577,7 @@ def live_turn(path=DB_PATH, max_age_s=1200, session_id=None):
                     "start_ms": lu[2], "now_ms": now_ms,
                     "elapsed_ms": max(0, now_ms - lu[2]), "n_calls": 0,
                     "ttft_ms": None, "turn_ttft_ms": None, "call_ttft_ms": None,
-                    "tps": None, "out_tokens": 0,
+                    "tps": None, "out_tokens": 0, "total_tokens": 0,
                     "models": [], "phase": 0,
                 }
 
@@ -582,6 +609,17 @@ def live_turn(path=DB_PATH, max_age_s=1200, session_id=None):
             # 首次调用进行中（尚无完成行）或纯工作流等待：出骨架行，界面显示“首步生成中”。
             # 走到这里时 done 检查已排除已结束的轮，只剩进行中的情形。
             rows = []
+        # 已记录消耗（主轮自身，全终态非 running）：实时行「已记录 X tok」的数据源，
+        # 与静态行的轮账本同主体；正在流式的调用完成前不计入（轮结束账本回填定稿）
+        tot_row = conn.execute(
+            """SELECT COALESCE(SUM(COALESCE(computed_total_tokens,
+                       COALESCE(input_tokens, 0) + COALESCE(output_tokens, 0))), 0)
+               FROM model_usage
+               WHERE session_id = ? AND turn_id = ? AND query_source = 'main_turn'
+                 AND status != 'running'""",
+            (sid, tid),
+        ).fetchone()
+        total_tok = tot_row[0] if tot_row else 0
         # 轮真实起点：最新 user 消息时刻（真实库验证 turn_usage.started_at 与
         # user 消息 time_created 483/520 差 ≤50ms、最大 1.7s）。必须先解析出
         # 轮起点再算 ttft——用调用 started_at 两种都错：最新调用时刻晚于首个
@@ -636,6 +674,7 @@ def live_turn(path=DB_PATH, max_age_s=1200, session_id=None):
             "call_ttft_ms": call_ttft,  # 首个完成调用的 TTFT（调用级口径）
             "tps": round(tps, 2) if tps else None,
             "out_tokens": out_tok,
+            "total_tokens": total_tok,  # 已记录消耗（主轮自身，全终态；见上方注释）
             "models": models,
             "phase": 1,
         }
